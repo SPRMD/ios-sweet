@@ -1,0 +1,942 @@
+diff --git a/iokit/Kernel/arm/PolarisDriverSupport.h b/iokit/Kernel/arm/PolarisDriverSupport.h
+--- a/iokit/Kernel/arm/PolarisDriverSupport.h
++++ b/iokit/Kernel/arm/PolarisDriverSupport.h
+@@ -1,11 +1,11 @@
+ /*
+  * Shared support for the Polaris IOKit bring-up services.
+  *
+- * This layer deliberately stops at device-tree/resource discovery.  It does
+- * not copy Android drivers, execute Qualcomm firmware, write MMIO registers,
+- * vote regulators, or create DMA mappings.  The four services are therefore
+- * useful as real XNU/IOKit integration points while their hardware backends
+- * remain opt-in work for later, separately validated patches.
++ * This layer contains the board gate and the small read-only SPMI observer
++ * backend used by the Polaris keys and battery services.  It never writes a
++ * PMIC register, votes a regulator, acknowledges an interrupt, executes
++ * Qualcomm firmware, or creates a DMA mapping.  All hardware reads are
++ * opt-in and a timed-out observer lane is poisoned for the rest of the boot.
+  */
+ #pragma once
+ 
+@@ -45,6 +45,13 @@
+ 
+ bool bootArgEnabled(const char *name);
+ 
++/* Read-only PM8998/PMI8998 SPMI observer access.  The address is the PMIC
++ * peripheral ID (sid << 8 | peripheral) plus an 8-bit register offset. */
++bool spmiInit(void);
++bool spmiRead(uint16_t peripheralId, uint8_t reg, uint8_t *bytes,
++	unsigned count);
++bool spmiReadByte(uint16_t peripheralId, uint8_t reg, uint8_t *value);
++
+ void publishCommon(IOService *service, const char *kind, const char *state,
+ 	bool hardwareWritesEnabled);
+ void publishNumber(IOService *service, const char *key, uint64_t value);
+diff --git a/iokit/Kernel/arm/PolarisDriverSupport.cpp b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+--- a/iokit/Kernel/arm/PolarisDriverSupport.cpp
++++ b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+@@ -7,10 +7,79 @@
+ extern "C" {
+ #include <sys/systm.h>
+ }
++#include <IOKit/IOLocks.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
+ #endif
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ namespace PolarisDriver {
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++
++/* Qualcomm SPMI PMIC arbiter v5.  The observer window is EE0, which is the
++ * application processor's read-only view.  The only store in this backend is
++ * an EXT_READL command; PMIC configuration and interrupt state are untouched. */
++#define POLARIS_SPMI_CORE_PA       0x0c440000UL
++#define POLARIS_SPMI_CORE_SIZE     0x2000UL
++#define POLARIS_SPMI_CNFG_PA       0x0c40a000UL
++#define POLARIS_SPMI_CNFG_SIZE     0x1000UL
++#define POLARIS_SPMI_OBSERVER_PA   0x0e600000UL
++#define POLARIS_SPMI_OBSERVER_SIZE 0x10000UL
++#define POLARIS_SPMI_VERSION       0x000
++#define POLARIS_SPMI_FEATURES      0x004
++#define POLARIS_SPMI_CHANNEL(n)    (0x900U + 4U * (n))
++#define POLARIS_SPMI_OWNER(n)      (0x700U + 4U * (n))
++#define POLARIS_SPMI_OBS_COMMAND   0x00
++#define POLARIS_SPMI_OBS_STATUS    0x08
++#define POLARIS_SPMI_OBS_DATA0     0x18
++#define POLARIS_SPMI_OBS_DATA1     0x1c
++#define POLARIS_SPMI_READ          (1U << 27)
++#define POLARIS_SPMI_DONE          0x01
++#define POLARIS_SPMI_ERROR_MASK    0x0e
++#define POLARIS_SPMI_MAX_CHANNELS  512U
++#define POLARIS_SPMI_NO_APID       0xffffU
++#define POLARIS_SPMI_TIMEOUT_US    2000U
++
++static vm_offset_t gSpmiCore;
++static vm_offset_t gSpmiConfig;
++static vm_offset_t gSpmiObserver;
++static IOLock *gSpmiLock;
++static uint16_t gSpmiApid[0x1000];
++static bool gSpmiPoisoned[POLARIS_SPMI_MAX_CHANNELS];
++static unsigned gSpmiCount;
++static bool gSpmiAttempted;
++static bool gSpmiReady;
++
++static uint32_t
++spmiReadMMIO(vm_offset_t base, uint32_t offset)
++{
++	uint32_t value = *(volatile uint32_t *)(base + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++static uint16_t
++spmiFindAPID(uint16_t peripheralId)
++{
++	uint16_t found = POLARIS_SPMI_NO_APID;
++	for (unsigned channel = 0; channel < gSpmiCount; ++channel) {
++		uint32_t mapping = spmiReadMMIO(gSpmiCore,
++		    POLARIS_SPMI_CHANNEL(channel));
++		if (mapping == 0 || ((mapping >> 8) & 0xfffU) != peripheralId) {
++			continue;
++		}
++		uint32_t owner = spmiReadMMIO(gSpmiConfig,
++		    POLARIS_SPMI_OWNER(channel)) & 7U;
++		/* Prefer the channel owned by the application processor. */
++		if (found == POLARIS_SPMI_NO_APID || owner == 0) {
++			found = (uint16_t)channel;
++		}
++	}
++	return found;
++}
++
++#endif /* !POLARIS_DRIVER_HOST_TEST */
+ 
+ static bool
+ compatibleContains(OSData *data, const char *wanted)
+@@ -114,6 +183,122 @@
+ 	return name != NULL && PE_parse_boot_argn(name, &value, sizeof(value)) && value == 1;
+ }
+ 
++bool
++spmiInit(void)
++{
++#if defined(POLARIS_DRIVER_HOST_TEST)
++	return true;
++#else
++	if (gSpmiAttempted) {
++		return gSpmiReady;
++	}
++	gSpmiAttempted = true;
++	gSpmiLock = IOLockAlloc();
++	if (gSpmiLock == NULL) {
++		IOLog("POLARIS SPMI: lock allocation failed\\n");
++		return false;
++	}
++	gSpmiCore = ml_io_map(POLARIS_SPMI_CORE_PA, POLARIS_SPMI_CORE_SIZE);
++	gSpmiConfig = ml_io_map(POLARIS_SPMI_CNFG_PA, POLARIS_SPMI_CNFG_SIZE);
++	gSpmiObserver = ml_io_map(POLARIS_SPMI_OBSERVER_PA,
++	    POLARIS_SPMI_OBSERVER_SIZE);
++	if (gSpmiCore == 0 || gSpmiConfig == 0 || gSpmiObserver == 0) {
++		IOLog("POLARIS SPMI: MMIO mapping failed\\n");
++		return false;
++	}
++	uint32_t version = spmiReadMMIO(gSpmiCore, POLARIS_SPMI_VERSION);
++	gSpmiCount = spmiReadMMIO(gSpmiCore, POLARIS_SPMI_FEATURES) & 0x7ffU;
++	if (version < 0x50000000U || version >= 0x70000000U ||
++	    gSpmiCount == 0 || gSpmiCount > POLARIS_SPMI_MAX_CHANNELS) {
++		IOLog("POLARIS SPMI: unsupported arbiter version=%#x channels=%u\\n",
++		    version, gSpmiCount);
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(gSpmiApid) / sizeof(gSpmiApid[0]); ++i) {
++		gSpmiApid[i] = POLARIS_SPMI_NO_APID;
++	}
++	for (unsigned i = 0; i < POLARIS_SPMI_MAX_CHANNELS; ++i) {
++		gSpmiPoisoned[i] = false;
++	}
++	gSpmiReady = true;
++	IOLog("POLARIS SPMI: observer v5 version=%#x channels=%u\\n",
++	    version, gSpmiCount);
++	return true;
++#endif
++}
++
++bool
++spmiRead(uint16_t peripheralId, uint8_t reg, uint8_t *bytes, unsigned count)
++{
++#if defined(POLARIS_DRIVER_HOST_TEST)
++	(void)peripheralId;
++	(void)reg;
++	(void)bytes;
++	(void)count;
++	return false;
++#else
++	if (!gSpmiReady || gSpmiLock == NULL || bytes == NULL || count == 0 ||
++	    count > 8 || peripheralId >= sizeof(gSpmiApid) / sizeof(gSpmiApid[0])) {
++		return false;
++	}
++	IOLockLock(gSpmiLock);
++	uint16_t apid = gSpmiApid[peripheralId];
++	if (apid == POLARIS_SPMI_NO_APID) {
++		apid = spmiFindAPID(peripheralId);
++		gSpmiApid[peripheralId] = apid;
++	}
++	if (apid == POLARIS_SPMI_NO_APID || apid >= POLARIS_SPMI_MAX_CHANNELS ||
++	    gSpmiPoisoned[apid]) {
++		IOLockUnlock(gSpmiLock);
++		return false;
++	}
++	const uint32_t lane = 0x80U * apid;
++	const uint32_t command = POLARIS_SPMI_READ |
++	    ((uint32_t)reg << 4) | (count - 1U);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(gSpmiObserver + lane + POLARIS_SPMI_OBS_COMMAND) = command;
++	__asm__ volatile("dsb osh" ::: "memory");
++	uint32_t status = 0;
++	unsigned waited = 0;
++	for (; waited < POLARIS_SPMI_TIMEOUT_US; ++waited) {
++		status = spmiReadMMIO(gSpmiObserver,
++		    lane + POLARIS_SPMI_OBS_STATUS);
++		if (status & POLARIS_SPMI_DONE) {
++			break;
++		}
++		/* IOSleep(1) would turn this microsecond budget into two seconds.
++		 * The observer transaction is already serialized and bounded; use a
++		 * one-microsecond busy delay so a bad lane cannot stall boot for long. */
++		IODelay(1);
++	}
++	if (!(status & POLARIS_SPMI_DONE) || (status & POLARIS_SPMI_ERROR_MASK)) {
++		if (!(status & POLARIS_SPMI_DONE)) {
++			gSpmiPoisoned[apid] = true;
++			IOLog("POLARIS SPMI: timeout ppid=%#x apid=%u\\n",
++			    peripheralId, apid);
++		}
++		IOLockUnlock(gSpmiLock);
++		return false;
++	}
++	uint32_t data0 = spmiReadMMIO(gSpmiObserver,
++	    lane + POLARIS_SPMI_OBS_DATA0);
++	uint32_t data1 = count > 4 ? spmiReadMMIO(gSpmiObserver,
++	    lane + POLARIS_SPMI_OBS_DATA1) : 0;
++	for (unsigned i = 0; i < count; ++i) {
++		bytes[i] = (uint8_t)((i < 4 ? data0 : data1) >>
++		    (8U * (i & 3U)));
++	}
++	IOLockUnlock(gSpmiLock);
++	return true;
++#endif
++}
++
++bool
++spmiReadByte(uint16_t peripheralId, uint8_t reg, uint8_t *value)
++{
++	return spmiRead(peripheralId, reg, value, 1);
++}
++
+ void
+ publishCommon(IOService *service, const char *kind, const char *state,
+ 	bool hardwareWritesEnabled)
+diff --git a/iokit/Kernel/arm/PolarisKeys.cpp b/iokit/Kernel/arm/PolarisKeys.cpp
+--- a/iokit/Kernel/arm/PolarisKeys.cpp
++++ b/iokit/Kernel/arm/PolarisKeys.cpp
+@@ -1,24 +1,175 @@
+ /*
+- * Polaris physical-key discovery service.
++ * Polaris physical keys.
+  *
+- * The stock DTB describes the power key in the PM8998 PON block and the
+- * volume-up/hall inputs under gpio_keys.  This object only publishes those
+- * relationships.  It does not claim an interrupt, touch TLMM/PMIC state, or
+- * synthesize IOHID events; those operations need a separately validated
+- * input path and a recovery plan.
++ * The stock Polaris DTB puts power and volume-down on the PM8998 PON block
++ * (SID 0, peripheral 0x08).  Volume-up is PM8998 SPMI GPIO6 (SID 0,
++ * peripheral 0xc5), despite the Linux gpio-keys node being easy to mistake
++ * for a TLMM GPIO.  This backend only issues observer EXT_READL operations;
++ * it never changes PMIC configuration or interrupt state.
++ *
++ * The backend is opt-in with polariskeys=1.  It waits until each input has
++ * first been observed released, requires two identical samples for a state
++ * change, and stops using a lane after an observer timeout.
+  */
+ #include "PolarisDriverSupport.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOLib.h>
++extern "C" void sweet_hid_key(int key, int down);
++#endif
++
+ class PolarisKeys : public IOService
+ {
+ 	OSDeclareDefaultStructors(PolarisKeys);
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++
++private:
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	void poll(void);
++	void report(unsigned key, bool pressed);
++	bool configure(void);
++	IOWorkLoop *fWorkLoop = NULL;
++	IOTimerEventSource *fTimer = NULL;
++	bool fTimerAdded = false;
++	bool fEnabled = false;
++	bool fPONUsable = false;
++	bool fGPIOUsable = false;
++	bool fLive[3] = {};
++	bool fLast[3] = {};
++	bool fCandidate[3] = {};
++	bool fCandidateValid[3] = {};
++	bool fDown[3] = {};
++#endif
+ };
+ 
+ OSDefineMetaClassAndStructors(PolarisKeys, IOService);
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++static const uint16_t kPONPeripheral = 0x008; /* PM8998 SID0, PON */
++static const uint16_t kGPIO6Peripheral = 0x0c5; /* PM8998 SID0, GPIO6 */
++static const uint8_t kPONStatus = 0x10;
++static const uint8_t kPONPowerMask = 0x80; /* KPDPWR_N */
++static const uint8_t kPONResinMask = 0x40; /* RESIN_N */
++static const uint8_t kGPIOStatus = 0x10;
++static const uint8_t kGPIOMode = 0x40;
++static const uint8_t kGPIOPull = 0x42;
++static const uint8_t kGPIOEnable = 0x46;
++
++bool
++PolarisKeys::configure(void)
++{
++	uint8_t type = 0, subtype = 0;
++	bool ponKnown = PolarisDriver::spmiReadByte(kPONPeripheral, 0x04, &type) &&
++	    PolarisDriver::spmiReadByte(kPONPeripheral, 0x05, &subtype);
++	if (!ponKnown || type != 0x01 || subtype != 0x09) {
++		IOLog("POLARIS KEYS: PON identity rejected type=%#x subtype=%#x\\n",
++		    type, subtype);
++	} else {
++		fPONUsable = true;
++	}
++
++	type = subtype = 0;
++	bool gpioKnown = PolarisDriver::spmiReadByte(kGPIO6Peripheral, 0x04, &type) &&
++	    PolarisDriver::spmiReadByte(kGPIO6Peripheral, 0x05, &subtype);
++	uint8_t mode = 0, pull = 0, enable = 0, level = 0;
++	if (gpioKnown) {
++		gpioKnown = PolarisDriver::spmiReadByte(kGPIO6Peripheral, kGPIOMode, &mode) &&
++		    PolarisDriver::spmiReadByte(kGPIO6Peripheral, kGPIOPull, &pull) &&
++		    PolarisDriver::spmiReadByte(kGPIO6Peripheral, kGPIOEnable, &enable) &&
++		    PolarisDriver::spmiReadByte(kGPIO6Peripheral, kGPIOStatus, &level);
++	}
++	const unsigned direction = mode & 3U;
++	if (!gpioKnown || type != 0x10 || subtype < 0x10 || subtype > 0x13 ||
++	    direction != 0 || (pull & 7U) >= 4 ||
++	    !(enable & 0x80U)) {
++		IOLog("POLARIS KEYS: GPIO6 identity/config rejected type=%#x subtype=%#x "
++		    "mode=%#x pull=%#x enable=%#x\\n", type, subtype, mode, pull, enable);
++	} else {
++		fGPIOUsable = true;
++		fLast[1] = !(level & 1U); /* active-low volume-up */
++	}
++	if (fPONUsable) {
++		uint8_t status = 0;
++		if (!PolarisDriver::spmiReadByte(kPONPeripheral, kPONStatus, &status)) {
++			fPONUsable = false;
++		} else {
++			fLast[0] = (status & kPONPowerMask) != 0;
++			fLast[2] = (status & kPONResinMask) != 0;
++		}
++	}
++	IOLog("POLARIS KEYS: PON=%d GPIO6=%d (read-only)\\n",
++	    fPONUsable, fGPIOUsable);
++	return fPONUsable || fGPIOUsable;
++}
++
++void
++PolarisKeys::report(unsigned key, bool pressed)
++{
++	if (key >= 3 || !((key == 1) ? fGPIOUsable : fPONUsable)) {
++		return;
++	}
++	/* Two consecutive equal samples are required before changing the stable
++	 * state.  This is the same debounce rule for PON and the PMIC GPIO. */
++	if (!fCandidateValid[key] || fCandidate[key] != pressed) {
++		fCandidate[key] = pressed;
++		fCandidateValid[key] = true;
++		return;
++	}
++	if (pressed == fLast[key]) {
++		if (!fLive[key] && !pressed) {
++			fLive[key] = true;
++			IOLog("POLARIS KEYS: key %u released; input trusted\\n", key);
++		}
++		return;
++	}
++	fLast[key] = pressed;
++	if (!fLive[key]) {
++		return;
++	}
++	if (pressed == fDown[key]) {
++		return;
++	}
++	fDown[key] = pressed;
++	IOLog("POLARIS KEYS: key=%u %s\\n", key, pressed ? "down" : "up");
++	sweet_hid_key((int)key, pressed ? 1 : 0);
++}
++
++void
++PolarisKeys::poll(void)
++{
++	uint8_t pon = 0, gpio = 0;
++	const bool ponOK = fPONUsable &&
++	    PolarisDriver::spmiReadByte(kPONPeripheral, kPONStatus, &pon);
++	const bool gpioOK = fGPIOUsable &&
++	    PolarisDriver::spmiReadByte(kGPIO6Peripheral, kGPIOStatus, &gpio);
++	if (ponOK) {
++		report(0, (pon & kPONPowerMask) != 0);
++		report(2, (pon & kPONResinMask) != 0);
++	}
++	if (gpioOK) {
++		report(1, !(gpio & 1U));
++	}
++}
++
++void
++PolarisKeys::timerFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	PolarisKeys *self = OSDynamicCast(PolarisKeys, owner);
++	if (self != NULL && self->fEnabled) {
++		self->poll();
++		sender->setTimeoutMS(16);
++	}
++}
++#endif /* !POLARIS_DRIVER_HOST_TEST */
+ 
+ bool
+ PolarisKeys::start(IOService *provider)
+@@ -26,53 +177,82 @@
+ 	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
+ 		return false;
+ 	}
+-	IORegistryEntry *pon = PolarisDriver::nodeAt(
+-	    "/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800");
+-	IORegistryEntry *gpioKeys = PolarisDriver::nodeAt("/soc/gpio_keys");
+-	IORegistryEntry *volumeUp = PolarisDriver::nodeAt("/soc/gpio_keys/vol_up");
+-	IORegistryEntry *hall = PolarisDriver::nodeAt("/soc/gpio_keys/hall_key");
+-	if (pon == NULL && gpioKeys == NULL) {
+-		IOLog("POLARIS KEYS: PM8998 PON/gpio_keys nodes absent; service withheld\n");
+-		OSSafeReleaseNULL(pon);
+-		OSSafeReleaseNULL(gpioKeys);
+-		OSSafeReleaseNULL(volumeUp);
+-		OSSafeReleaseNULL(hall);
+-		return false;
+-	}
+-	unsigned ponCount = 0;
+-	static const char *const ponPaths[] = {
+-		"/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800/pon_1",
+-		"/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800/pon_2",
+-		"/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800/pon_3",
+-	};
+-	for (unsigned i = 0; i < sizeof(ponPaths) / sizeof(ponPaths[0]); ++i) {
+-		IORegistryEntry *child = PolarisDriver::nodeAt(ponPaths[i]);
+-		if (child != NULL) {
+-			ponCount++;
+-		}
+-		OSSafeReleaseNULL(child);
+-	}
+-	PolarisDriver::publishCommon(this, "Keys", "probe-only", false);
+-	PolarisDriver::publishString(this, "PowerKeySource", "PM8998 PON qcom,power-on@800");
+-	PolarisDriver::publishString(this, "VolumeKeySource", "TLMM gpio_keys/vol_up (GPIO6, active-low in stock DTB)");
+-	PolarisDriver::publishString(this, "HallKeySource", "gpio_keys/hall_key (variant-dependent)");
+-	PolarisDriver::publishString(this, "InputBackend", "IOHID event/interrupt backend not implemented");
+-	PolarisDriver::publishNumber(this, "PONNodePresent", pon != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "PONChildCount", ponCount);
+-	PolarisDriver::publishNumber(this, "GPIOKeysPresent", gpioKeys != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "VolumeUpNodePresent", volumeUp != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "HallKeyNodePresent", hall != NULL ? 1 : 0);
++	PolarisDriver::publishCommon(this, "Keys",
++#if defined(POLARIS_DRIVER_HOST_TEST)
++	    "host-test", false);
++#else
++	    "probe-only", false);
++#endif
++	PolarisDriver::publishString(this, "PowerKeySource",
++	    "PM8998 SID0 PON peripheral 0x08, KPDPWR_N");
++	PolarisDriver::publishString(this, "VolumeDownSource",
++	    "PM8998 SID0 PON peripheral 0x08, RESIN_N");
++	PolarisDriver::publishString(this, "VolumeUpSource",
++	    "PM8998 SID0 SPMI GPIO6 peripheral 0xc5, active-low");
++	PolarisDriver::publishString(this, "InputBackend",
++	    "read-only SPMI observer plus Sweet HID consumer-control events");
++
++#if defined(POLARIS_DRIVER_HOST_TEST)
+ 	setName("PolarisKeys");
+ 	registerService();
+-	IOLog("POLARIS KEYS: PON=%u children=%u gpio_keys=%u vol_up=%u hall=%u; writes disabled\n",
+-	    pon != NULL ? 1 : 0, ponCount, gpioKeys != NULL ? 1 : 0,
+-	    volumeUp != NULL ? 1 : 0, hall != NULL ? 1 : 0);
+-	OSSafeReleaseNULL(pon);
+-	OSSafeReleaseNULL(gpioKeys);
+-	OSSafeReleaseNULL(volumeUp);
+-	OSSafeReleaseNULL(hall);
+ 	return true;
+-}
++#else
++	if (!PolarisDriver::bootArgEnabled("polariskeys")) {
++		PolarisDriver::publishString(this, "PolarisDriverState", "disabled; set polariskeys=1");
++		setName("PolarisKeys");
++		registerService();
++		IOLog("POLARIS KEYS: disabled (set polariskeys=1 to opt in)\\n");
++		return true;
++	}
++	if (!PolarisDriver::spmiInit() || !configure()) {
++		IOLog("POLARIS KEYS: observer/configuration unavailable; no input events\\n");
++		return true;
++	}
++	fWorkLoop = IOWorkLoop::workLoop();
++	fTimer = fWorkLoop != NULL ? IOTimerEventSource::timerEventSource(
++	    this, &PolarisKeys::timerFired) : NULL;
++	if (fWorkLoop == NULL || fTimer == NULL ||
++	    fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fTimer);
++		OSSafeReleaseNULL(fWorkLoop);
++		IOLog("POLARIS KEYS: timer setup failed; no input events\\n");
++		return true;
++	}
++	fTimerAdded = true;
++	fEnabled = true;
++	fTimer->setTimeoutMS(16);
++	PolarisDriver::publishString(this, "PolarisDriverState", "read-only polling");
++	PolarisDriver::publishString(this, "DeviceOperations", "SPMI observer reads; HID event dispatch");
++	setName("PolarisKeys");
++	registerService();
++	IOLog("POLARIS KEYS: active; power/volume inputs poll every 16 ms\\n");
++	return true;
++#endif
++}
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++void
++PolarisKeys::stop(IOService *provider)
++{
++	fEnabled = false;
++	if (fTimer != NULL) {
++		fTimer->cancelTimeout();
++	}
++	if (fWorkLoop != NULL && fTimerAdded) {
++		fWorkLoop->removeEventSource(fTimer);
++		fTimerAdded = false;
++	}
++	IOService::stop(provider);
++}
++
++void
++PolarisKeys::free(void)
++{
++	OSSafeReleaseNULL(fTimer);
++	OSSafeReleaseNULL(fWorkLoop);
++	IOService::free();
++}
++#endif
+ 
+ extern "C" bool
+ PolarisKeysStart(IOService *provider)
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+--- a/iokit/Kernel/arm/PolarisBattery.cpp
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -1,78 +1,292 @@
+ /*
+- * Polaris battery/fuel-gauge discovery service.
++ * Polaris PMI8998 Gen3 fuel-gauge power source.
+  *
+- * Polaris uses the PMI8998 Gen3 fuel gauge and SMB2 charger nodes.  The
+- * service publishes the DT topology and battery-profile source only.  It is
+- * intentionally not an IOPMPowerSource yet: no SPMI observer transaction,
+- * interrupt handler, charger vote, or SOC value is fabricated here.
++ * The stock DTB places FG_BATT_SOC at SPMI SID2 peripheral 0x40 and
++ * FG_BATT_INFO at SID2 peripheral 0x41.  The register conversions below are
++ * taken from the matching qcom,fg-gen3 driver in the local MIUI source tree.
++ * This service reads SOC, voltage, current and temperature only.  It never
++ * accesses the MEMIF SRAM window, charger votes, JEITA configuration or
++ * interrupt registers.
++ *
++ * Enable with polarisbattery=1.  A failed read publishes a conservative
++ * fallback source so powerd still has a complete battery object; the
++ * HardwareSampleValid property makes that fallback visible in diagnostics.
+  */
+ #include "PolarisDriverSupport.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSBoolean.h>
++#endif
++
++#if defined(POLARIS_DRIVER_HOST_TEST)
+ class PolarisBattery : public IOService
++#else
++class PolarisBattery : public IOPMPowerSource
++#endif
+ {
+ 	OSDeclareDefaultStructors(PolarisBattery);
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++
++private:
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	void poll(void);
++	void publish(unsigned percent, unsigned mv, int ma, int temperature,
++	    bool measured, bool currentValid);
++	void putBool(const char *key, bool value);
++	void putNumber(const char *key, long long value);
++	static bool readPair(uint16_t peripheral, uint8_t reg, uint16_t *value);
++	static unsigned socPercent(uint16_t raw);
++	IOWorkLoop *fWorkLoop = NULL;
++	IOTimerEventSource *fTimer = NULL;
++	bool fTimerAdded = false;
++	bool fRunning = false;
++	bool fReal = false;
++#endif
+ };
+ 
+-OSDefineMetaClassAndStructors(PolarisBattery, IOService);
++OSDefineMetaClassAndStructors(PolarisBattery,
++#if defined(POLARIS_DRIVER_HOST_TEST)
++    IOService
++#else
++    IOPMPowerSource
++#endif
++);
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++static const uint16_t kBattSocPeripheral = 0x240; /* SID2, reg base 0x4000 */
++static const uint16_t kBattInfoPeripheral = 0x241; /* SID2, reg base 0x4100 */
++static const uint8_t kBattSocSubtype = 0x10;
++static const uint8_t kBattInfoSubtype = 0x11;
++static const uint8_t kBattSocMonotonic = 0x09;
++static const uint8_t kBattInfoTemp = 0x50;
++static const uint8_t kBattInfoVoltage = 0xa0;
++static const uint8_t kBattInfoCurrent = 0xa2;
++static const unsigned kNominalCapacityMah = 3400;
++
++bool
++PolarisBattery::readPair(uint16_t peripheral, uint8_t reg, uint16_t *value)
++{
++	uint8_t first[2] = {}, second[2] = {};
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		if (!PolarisDriver::spmiRead(peripheral, reg, first, 2)) {
++			return false;
++		}
++		if (!PolarisDriver::spmiRead(peripheral, reg, second, 2)) {
++			return false;
++		}
++		if (first[0] == second[0] && first[1] == second[1]) {
++			*value = (uint16_t)first[0] | ((uint16_t)first[1] << 8);
++			return true;
++		}
++	}
++	return false;
++}
++
++unsigned
++PolarisBattery::socPercent(uint16_t raw)
++{
++	/* The Gen3 driver exposes a shadow byte and rejects mismatched copies. */
++	uint8_t bytes[2] = {(uint8_t)(raw & 0xffU), (uint8_t)(raw >> 8)};
++	if (bytes[0] != bytes[1]) {
++		return 0;
++	}
++	unsigned value = ((unsigned)bytes[0] * 100U + 127U) / 255U;
++	return value > 100U ? 100U : value;
++}
++
++void
++PolarisBattery::putBool(const char *key, bool value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	if (symbol != NULL) {
++		setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse);
++	}
++	OSSafeReleaseNULL(symbol);
++}
++
++void
++PolarisBattery::putNumber(const char *key, long long value)
++{
++	const OSSymbol *symbol = OSSymbol::withCString(key);
++	OSNumber *number = OSNumber::withNumber((unsigned long long)value, 64);
++	if (symbol != NULL && number != NULL) {
++		setPSProperty(symbol, number);
++	}
++	OSSafeReleaseNULL(number);
++	OSSafeReleaseNULL(symbol);
++}
++
++void
++PolarisBattery::publish(unsigned percent, unsigned mv, int ma, int temperature,
++    bool measured, bool currentValid)
++{
++	setBatteryInstalled(true);
++	const unsigned capacity = (kNominalCapacityMah * percent + 50U) / 100U;
++	setCurrentCapacity(capacity);
++	setMaxCapacity(kNominalCapacityMah);
++	setExternalConnected(false);
++	setExternalChargeCapable(false);
++	setIsCharging(false);
++	setAtWarnLevel(false);
++	setAtCriticalLevel(false);
++	setVoltage(mv);
++	setAmperage(ma);
++	setTimeRemaining(-1);
++	setCycleCount(0);
++	putBool("FullyCharged", measured && percent >= 100);
++	putBool("AppleRawExternalConnected", false);
++	putNumber("AppleRawCurrentCapacity", capacity);
++	putNumber("AppleRawMaxCapacity", kNominalCapacityMah);
++	putNumber("NominalChargeCapacity", kNominalCapacityMah);
++	putNumber("DesignCapacity", kNominalCapacityMah);
++	putNumber("InstantAmperage", ma);
++	putNumber("Temperature", temperature);
++	putBool("PolarisBatteryHardwareSampleValid", measured);
++	putBool("PolarisBatteryCurrentValid", currentValid);
++	putBool("PolarisBatteryChargerStatusValid", false);
++	putNumber("PolarisBatteryPercent", percent);
++	updateStatus();
++}
++
++void
++PolarisBattery::poll(void)
++{
++	uint8_t socSubtype = 0, infoSubtype = 0;
++	uint16_t rawSoc = 0, rawVoltage = 0, rawCurrent = 0, rawTemperature = 0;
++	const bool identities =
++	    PolarisDriver::spmiReadByte(kBattSocPeripheral, 0x05, &socSubtype) &&
++	    PolarisDriver::spmiReadByte(kBattInfoPeripheral, 0x05, &infoSubtype) &&
++	    socSubtype == kBattSocSubtype && infoSubtype == kBattInfoSubtype;
++	const bool valid = identities &&
++	    readPair(kBattSocPeripheral, kBattSocMonotonic, &rawSoc) &&
++	    readPair(kBattInfoPeripheral, kBattInfoVoltage, &rawVoltage) &&
++	    readPair(kBattInfoPeripheral, kBattInfoCurrent, &rawCurrent) &&
++	    readPair(kBattInfoPeripheral, kBattInfoTemp, &rawTemperature);
++	if (!valid) {
++		publish(100, 4200, 0, 2500, false, false);
++		return;
++	}
++	unsigned percent = socPercent(rawSoc);
++	if (percent > 100U) {
++		publish(100, 4200, 0, 2500, false, false);
++		return;
++	}
++	const unsigned mv = (unsigned)(((uint64_t)rawVoltage * 122070ULL) / 1000000ULL);
++	int16_t signedRaw = (int16_t)rawCurrent;
++	const int ma = (int)(-((int64_t)signedRaw * 488281LL) / 1000000LL);
++	const unsigned kelvinQuarter =
++	    ((((unsigned)(rawTemperature & 0x07ffU)) + 2U) / 4U);
++	const int temperature = ((int)kelvinQuarter - 273) * 100;
++	if (mv < 2800U || mv > 4600U || temperature < -4000 || temperature > 9000) {
++		publish(100, 4200, 0, 2500, false, false);
++		return;
++	}
++	publish(percent, mv, ma, temperature, true, true);
++}
++
++void
++PolarisBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	PolarisBattery *self = OSDynamicCast(PolarisBattery, owner);
++	if (self != NULL && self->fRunning) {
++		self->poll();
++		sender->setTimeoutMS(30000);
++	}
++}
++#endif /* !POLARIS_DRIVER_HOST_TEST */
+ 
+ bool
+ PolarisBattery::start(IOService *provider)
+ {
++#if defined(POLARIS_DRIVER_HOST_TEST)
+ 	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
+ 		return false;
+ 	}
+-	IORegistryEntry *spmi = PolarisDriver::nodeAt("/soc/qcom,spmi@c440000");
+-	IORegistryEntry *fuelGauge = PolarisDriver::nodeAt(
+-	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg");
+-	IORegistryEntry *soc = PolarisDriver::nodeAt(
+-	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg/qcom,fg-batt-soc@4000");
+-	IORegistryEntry *charger = PolarisDriver::nodeAt(
+-	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qcom,qpnp-smb2");
+-	IORegistryEntry *profiles = PolarisDriver::nodeAt("/vendor/qcom,battery-data");
+-	if (fuelGauge == NULL && charger == NULL) {
+-		IOLog("POLARIS BATTERY: PMI8998 fuel-gauge/SMB2 nodes absent; service withheld\n");
+-		OSSafeReleaseNULL(spmi);
+-		OSSafeReleaseNULL(fuelGauge);
+-		OSSafeReleaseNULL(soc);
+-		OSSafeReleaseNULL(charger);
+-		OSSafeReleaseNULL(profiles);
+-		return false;
+-	}
+-	IORegistryEntry *info = PolarisDriver::nodeAt(
+-	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg/qcom,fg-batt-info@4100");
+-	IORegistryEntry *memif = PolarisDriver::nodeAt(
+-	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg/qcom,fg-memif@4400");
+-	PolarisDriver::publishCommon(this, "Battery", "probe-only", false);
+-	PolarisDriver::publishString(this, "FuelGauge", "PMI8998 qcom,fg-gen3");
+-	PolarisDriver::publishString(this, "Charger", "PMI8998 qcom,qpnp-smb2");
+-	PolarisDriver::publishString(this, "ProfileSource", "/vendor/qcom,battery-data");
+-	PolarisDriver::publishString(this, "PowerSourceBackend",
+-	    "IOPMPowerSource/SPMI read path not implemented");
+-	PolarisDriver::publishNumber(this, "SPMINodePresent", spmi != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "FuelGaugePresent", fuelGauge != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "SOCBlockPresent", soc != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "BatteryInfoBlockPresent", info != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "MemoryInterfacePresent", memif != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "ChargerPresent", charger != NULL ? 1 : 0);
+-	PolarisDriver::publishNumber(this, "BatteryProfilesPresent", profiles != NULL ? 1 : 0);
++	PolarisDriver::publishCommon(this, "Battery", "host-test", false);
+ 	setName("PolarisBattery");
+ 	registerService();
+-	IOLog("POLARIS BATTERY: FG=%u SOC=%u info=%u memif=%u charger=%u profiles=%u; reads withheld\n",
+-	    fuelGauge != NULL ? 1 : 0, soc != NULL ? 1 : 0, info != NULL ? 1 : 0,
+-	    memif != NULL ? 1 : 0, charger != NULL ? 1 : 0, profiles != NULL ? 1 : 0);
+-	OSSafeReleaseNULL(spmi);
+-	OSSafeReleaseNULL(fuelGauge);
+-	OSSafeReleaseNULL(soc);
+-	OSSafeReleaseNULL(info);
+-	OSSafeReleaseNULL(memif);
+-	OSSafeReleaseNULL(charger);
+-	OSSafeReleaseNULL(profiles);
+ 	return true;
+-}
++#else
++	if (!PolarisDriver::boardMatches() || !IOPMPowerSource::start(provider)) {
++		return false;
++	}
++	PolarisDriver::publishString(this, "FuelGauge", "PMI8998 qcom,fg-gen3");
++	PolarisDriver::publishString(this, "RegisterMap",
++	    "SID2/0x40 SOC +0x09; SID2/0x41 voltage +0xa0 current +0xa2 temp +0x50");
++	PolarisDriver::publishString(this, "ChargerStatus",
++	    "not claimed; SMB2 charger remains firmware-owned");
++	if (!PolarisDriver::bootArgEnabled("polarisbattery") ||
++	    !PolarisDriver::spmiInit()) {
++		fReal = false;
++		publish(100, 4200, 0, 2500, false, false);
++		PolarisDriver::publishString(this, "PolarisDriverState", "fallback; set polarisbattery=1");
++	} else {
++		fReal = true;
++		poll();
++	}
++	fWorkLoop = IOWorkLoop::workLoop();
++	fTimer = fWorkLoop != NULL ? IOTimerEventSource::timerEventSource(
++	    this, &PolarisBattery::timerFired) : NULL;
++	if (fReal && fWorkLoop != NULL && fTimer != NULL &&
++	    fWorkLoop->addEventSource(fTimer) == kIOReturnSuccess) {
++		fTimerAdded = true;
++		fRunning = true;
++		fTimer->setTimeoutMS(30000);
++	} else {
++		if (fReal) {
++			fReal = false;
++			publish(100, 4200, 0, 2500, false, false);
++		}
++		OSSafeReleaseNULL(fTimer);
++		OSSafeReleaseNULL(fWorkLoop);
++	}
++	PolarisDriver::publishString(this, "PolarisDriverState",
++	    fReal ? "read-only SPMI fuel-gauge polling" : "fallback");
++	PolarisDriver::publishString(this, "DeviceOperations",
++	    fReal ? "SPMI observer reads only" : "none");
++	setName("PolarisBattery");
++	registerService();
++	IOLog("POLARIS BATTERY: %s\\n", fReal ? "read-only source active" : "fallback source active");
++	return true;
++#endif
++}
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++void
++PolarisBattery::stop(IOService *provider)
++{
++	fRunning = false;
++	if (fTimer != NULL) {
++		fTimer->cancelTimeout();
++	}
++	if (fWorkLoop != NULL && fTimerAdded) {
++		fWorkLoop->removeEventSource(fTimer);
++		fTimerAdded = false;
++	}
++	IOPMPowerSource::stop(provider);
++}
++
++void
++PolarisBattery::free(void)
++{
++	OSSafeReleaseNULL(fTimer);
++	OSSafeReleaseNULL(fWorkLoop);
++	IOPMPowerSource::free();
++}
++#endif
+ 
+ extern "C" bool
+ PolarisBatteryStart(IOService *provider)
+diff --git a/iokit/Kernel/arm/PolarisDrivers.cpp b/iokit/Kernel/arm/PolarisDrivers.cpp
+--- a/iokit/Kernel/arm/PolarisDrivers.cpp
++++ b/iokit/Kernel/arm/PolarisDrivers.cpp
+@@ -16,7 +16,7 @@
+ 	if (provider == NULL || !PolarisDriver::boardMatches()) {
+ 		return;
+ 	}
+-	IOLog("POLARIS DRIVERS: starting IOKit probe services\n");
++	IOLog("POLARIS DRIVERS: starting Polaris IOKit services\n");
+ 	(void)PolarisGPUStart(provider);
+ 	(void)PolarisWiFiStart(provider);
+ 	(void)PolarisBluetoothStart(provider);
+@@ -25,6 +25,6 @@
+ 	(void)PolarisBatteryStart(provider);
+ 	(void)PolarisNFCStart(provider);
+ 	(void)PolarisFingerprintStart(provider);
+-	IOLog("POLARIS DRIVERS: probe services complete; all hardware writes disabled\n");
++	IOLog("POLARIS DRIVERS: services complete; only opt-in read-only SPMI observer access is enabled\n");
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,7 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include "PolarisDriverSupport.h"
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -259,6 +260,11 @@
+ bool
+ SweetBattery::start(IOService *provider)
+ {
++	if (PolarisDriver::boardMatches() &&
++	    PolarisDriver::bootArgEnabled("polarisbattery")) {
++		IOLog("SWEET BATTERY: skipped on Polaris; PolarisBattery owns the power source\n");
++		return false;
++	}
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}

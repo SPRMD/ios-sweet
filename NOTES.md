@@ -1,5 +1,13 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Fork handoff (2026-10-30)
+
+- The working fork is `SPRMD/ios-sweet`; the local branch for this bring-up is intended to be `codex/polaris-drivers-0096`.
+- Patches 0082–0096 were imported from the local Polaris work. Patches 0094–0096 add real XNU/IOKit probe services for GPU, Wi-Fi, Bluetooth, camera, keys, battery, NFC and fingerprint discovery, with board gating and read-only backends.
+- These patches do not yet make the listed peripherals functional. They deliberately stop before firmware loading, DMA, interrupts, regulator writes, Qualcomm transport setup, camera pipelines, or fingerprint/TEE integration.
+- Local checks completed: `tools/validate-repo.py` passes for 96 contiguous patches, 15 Python tools and 7 shell scripts. A clean xnu-8796.121.2 worktree accepted all 96 patches after the pinned libpthread, BearSSL and HFS sources were staged.
+- The phone remains on stock MIUI. No fastboot, adb, partition flashing, Apple firmware, root image, device backup or serial-number data belongs in this repository.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

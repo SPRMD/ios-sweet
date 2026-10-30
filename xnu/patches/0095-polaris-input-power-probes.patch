@@ -1,0 +1,347 @@
+diff --git a/iokit/Kernel/arm/PolarisKeys.cpp b/iokit/Kernel/arm/PolarisKeys.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisKeys.cpp
+@@ -0,0 +1,82 @@
++/*
++ * Polaris physical-key discovery service.
++ *
++ * The stock DTB describes the power key in the PM8998 PON block and the
++ * volume-up/hall inputs under gpio_keys.  This object only publishes those
++ * relationships.  It does not claim an interrupt, touch TLMM/PMIC state, or
++ * synthesize IOHID events; those operations need a separately validated
++ * input path and a recovery plan.
++ */
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisKeys : public IOService
++{
++	OSDeclareDefaultStructors(PolarisKeys);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisKeys, IOService);
++
++bool
++PolarisKeys::start(IOService *provider)
++{
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	IORegistryEntry *pon = PolarisDriver::nodeAt(
++	    "/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800");
++	IORegistryEntry *gpioKeys = PolarisDriver::nodeAt("/soc/gpio_keys");
++	IORegistryEntry *volumeUp = PolarisDriver::nodeAt("/soc/gpio_keys/vol_up");
++	IORegistryEntry *hall = PolarisDriver::nodeAt("/soc/gpio_keys/hall_key");
++	if (pon == NULL && gpioKeys == NULL) {
++		IOLog("POLARIS KEYS: PM8998 PON/gpio_keys nodes absent; service withheld\n");
++		OSSafeReleaseNULL(pon);
++		OSSafeReleaseNULL(gpioKeys);
++		OSSafeReleaseNULL(volumeUp);
++		OSSafeReleaseNULL(hall);
++		return false;
++	}
++	unsigned ponCount = 0;
++	static const char *const ponPaths[] = {
++		"/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800/pon_1",
++		"/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800/pon_2",
++		"/soc/qcom,spmi@c440000/qcom,pm8998@0/qcom,power-on@800/pon_3",
++	};
++	for (unsigned i = 0; i < sizeof(ponPaths) / sizeof(ponPaths[0]); ++i) {
++		IORegistryEntry *child = PolarisDriver::nodeAt(ponPaths[i]);
++		if (child != NULL) {
++			ponCount++;
++		}
++		OSSafeReleaseNULL(child);
++	}
++	PolarisDriver::publishCommon(this, "Keys", "probe-only", false);
++	PolarisDriver::publishString(this, "PowerKeySource", "PM8998 PON qcom,power-on@800");
++	PolarisDriver::publishString(this, "VolumeKeySource", "TLMM gpio_keys/vol_up (GPIO6, active-low in stock DTB)");
++	PolarisDriver::publishString(this, "HallKeySource", "gpio_keys/hall_key (variant-dependent)");
++	PolarisDriver::publishString(this, "InputBackend", "IOHID event/interrupt backend not implemented");
++	PolarisDriver::publishNumber(this, "PONNodePresent", pon != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "PONChildCount", ponCount);
++	PolarisDriver::publishNumber(this, "GPIOKeysPresent", gpioKeys != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "VolumeUpNodePresent", volumeUp != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "HallKeyNodePresent", hall != NULL ? 1 : 0);
++	setName("PolarisKeys");
++	registerService();
++	IOLog("POLARIS KEYS: PON=%u children=%u gpio_keys=%u vol_up=%u hall=%u; writes disabled\n",
++	    pon != NULL ? 1 : 0, ponCount, gpioKeys != NULL ? 1 : 0,
++	    volumeUp != NULL ? 1 : 0, hall != NULL ? 1 : 0);
++	OSSafeReleaseNULL(pon);
++	OSSafeReleaseNULL(gpioKeys);
++	OSSafeReleaseNULL(volumeUp);
++	OSSafeReleaseNULL(hall);
++	return true;
++}
++
++extern "C" bool
++PolarisKeysStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisKeys>(provider, "KEYS");
++}
++#endif
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -0,0 +1,82 @@
++/*
++ * Polaris battery/fuel-gauge discovery service.
++ *
++ * Polaris uses the PMI8998 Gen3 fuel gauge and SMB2 charger nodes.  The
++ * service publishes the DT topology and battery-profile source only.  It is
++ * intentionally not an IOPMPowerSource yet: no SPMI observer transaction,
++ * interrupt handler, charger vote, or SOC value is fabricated here.
++ */
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisBattery : public IOService
++{
++	OSDeclareDefaultStructors(PolarisBattery);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisBattery, IOService);
++
++bool
++PolarisBattery::start(IOService *provider)
++{
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	IORegistryEntry *spmi = PolarisDriver::nodeAt("/soc/qcom,spmi@c440000");
++	IORegistryEntry *fuelGauge = PolarisDriver::nodeAt(
++	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg");
++	IORegistryEntry *soc = PolarisDriver::nodeAt(
++	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg/qcom,fg-batt-soc@4000");
++	IORegistryEntry *charger = PolarisDriver::nodeAt(
++	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qcom,qpnp-smb2");
++	IORegistryEntry *profiles = PolarisDriver::nodeAt("/vendor/qcom,battery-data");
++	if (fuelGauge == NULL && charger == NULL) {
++		IOLog("POLARIS BATTERY: PMI8998 fuel-gauge/SMB2 nodes absent; service withheld\n");
++		OSSafeReleaseNULL(spmi);
++		OSSafeReleaseNULL(fuelGauge);
++		OSSafeReleaseNULL(soc);
++		OSSafeReleaseNULL(charger);
++		OSSafeReleaseNULL(profiles);
++		return false;
++	}
++	IORegistryEntry *info = PolarisDriver::nodeAt(
++	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg/qcom,fg-batt-info@4100");
++	IORegistryEntry *memif = PolarisDriver::nodeAt(
++	    "/soc/qcom,spmi@c440000/qcom,pmi8998@2/qpnp,fg/qcom,fg-memif@4400");
++	PolarisDriver::publishCommon(this, "Battery", "probe-only", false);
++	PolarisDriver::publishString(this, "FuelGauge", "PMI8998 qcom,fg-gen3");
++	PolarisDriver::publishString(this, "Charger", "PMI8998 qcom,qpnp-smb2");
++	PolarisDriver::publishString(this, "ProfileSource", "/vendor/qcom,battery-data");
++	PolarisDriver::publishString(this, "PowerSourceBackend",
++	    "IOPMPowerSource/SPMI read path not implemented");
++	PolarisDriver::publishNumber(this, "SPMINodePresent", spmi != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "FuelGaugePresent", fuelGauge != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "SOCBlockPresent", soc != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "BatteryInfoBlockPresent", info != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "MemoryInterfacePresent", memif != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "ChargerPresent", charger != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "BatteryProfilesPresent", profiles != NULL ? 1 : 0);
++	setName("PolarisBattery");
++	registerService();
++	IOLog("POLARIS BATTERY: FG=%u SOC=%u info=%u memif=%u charger=%u profiles=%u; reads withheld\n",
++	    fuelGauge != NULL ? 1 : 0, soc != NULL ? 1 : 0, info != NULL ? 1 : 0,
++	    memif != NULL ? 1 : 0, charger != NULL ? 1 : 0, profiles != NULL ? 1 : 0);
++	OSSafeReleaseNULL(spmi);
++	OSSafeReleaseNULL(fuelGauge);
++	OSSafeReleaseNULL(soc);
++	OSSafeReleaseNULL(info);
++	OSSafeReleaseNULL(memif);
++	OSSafeReleaseNULL(charger);
++	OSSafeReleaseNULL(profiles);
++	return true;
++}
++
++extern "C" bool
++PolarisBatteryStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisBattery>(provider, "BATTERY");
++}
++#endif
+diff --git a/iokit/Kernel/arm/PolarisNFC.cpp b/iokit/Kernel/arm/PolarisNFC.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisNFC.cpp
+@@ -0,0 +1,70 @@
++/*
++ * Polaris NFC discovery service.
++ *
++ * The stock DTB exposes an NXP PN553-class controller through qcom,nq-nci at
++ * I2C address 0x28, with GPIO/clock/ese control pins.  The Android vendor
++ * image contains libpn553_fw.so and libpn553_rec.so.  This object records the
++ * mapping but deliberately does not toggle VEN, request CLKREQ, send NCI, or
++ * load firmware.
++ */
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisNFC : public IOService
++{
++	OSDeclareDefaultStructors(PolarisNFC);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisNFC, IOService);
++
++bool
++PolarisNFC::start(IOService *provider)
++{
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	IORegistryEntry *nq = PolarisDriver::nodeAt("/soc/i2c@88c000/nq@28");
++	IORegistryEntry *pinctrl = PolarisDriver::nodeAt("/soc/pinctrl@03400000/nfc");
++	IORegistryEntry *pmicClock = PolarisDriver::nodeAt(
++	    "/soc/qcom,spmi@c440000/qcom,pm8998@0/pinctrl@c000/nfc_clk");
++	if (nq == NULL && pinctrl == NULL) {
++		IOLog("POLARIS NFC: qcom,nq-nci/pinctrl nodes absent; service withheld\n");
++		OSSafeReleaseNULL(nq);
++		OSSafeReleaseNULL(pinctrl);
++		OSSafeReleaseNULL(pmicClock);
++		return false;
++	}
++	PolarisDriver::ResourceRange ranges[2] = {};
++	unsigned rangeCount = nq != NULL ? PolarisDriver::readRanges(nq, ranges, 2) : 0;
++	PolarisDriver::publishCommon(this, "NFC", "probe-only", false);
++	PolarisDriver::publishString(this, "Controller", "NXP PN553-class qcom,nq-nci");
++	PolarisDriver::publishString(this, "Transport", "QUP I2C /soc/i2c@88c000, address 0x28");
++	PolarisDriver::publishString(this, "FirmwareCandidates",
++	    "/firmware/libpn553_fw.so,/firmware/libpn553_rec.so");
++	PolarisDriver::publishString(this, "ControlResources",
++	    "nq-irq,nq-ven,nq-clkreq,nq-esepwr plus NFC pinctrl");
++	PolarisDriver::publishString(this, "NCIBackend", "not implemented; no I2C/GPIO/firmware operations");
++	PolarisDriver::publishNumber(this, "I2CNQNodePresent", nq != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "NFCGPIOPinctrlPresent", pinctrl != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "PMICClockPinctrlPresent", pmicClock != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "I2CResourceCount", rangeCount);
++	setName("PolarisNFC");
++	registerService();
++	IOLog("POLARIS NFC: nq=%u pinctrl=%u pmic-clock=%u resources=%u; writes disabled\n",
++	    nq != NULL ? 1 : 0, pinctrl != NULL ? 1 : 0, pmicClock != NULL ? 1 : 0,
++	    rangeCount);
++	OSSafeReleaseNULL(nq);
++	OSSafeReleaseNULL(pinctrl);
++	OSSafeReleaseNULL(pmicClock);
++	return true;
++}
++
++extern "C" bool
++PolarisNFCStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisNFC>(provider, "NFC");
++}
++#endif
+diff --git a/iokit/Kernel/arm/PolarisFingerprint.cpp b/iokit/Kernel/arm/PolarisFingerprint.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisFingerprint.cpp
+@@ -0,0 +1,58 @@
++/*
++ * Polaris fingerprint discovery service.
++ *
++ * The common DTB contains both FPC1020 and Goodix candidate nodes because
++ * Xiaomi shipped board/variant overlays.  Until the selected overlay, bus,
++ * reset/IRQ wiring and secure enrollment protocol are identified, the service
++ * only publishes candidate identities and never touches GPIO/SPI/TEE state.
++ */
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisFingerprint : public IOService
++{
++	OSDeclareDefaultStructors(PolarisFingerprint);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisFingerprint, IOService);
++
++bool
++PolarisFingerprint::start(IOService *provider)
++{
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	IORegistryEntry *fpc = PolarisDriver::nodeAt("/soc/fingerprint_fpc");
++	IORegistryEntry *goodix = PolarisDriver::nodeAt("/soc/fingerprint_goodix");
++	if (fpc == NULL && goodix == NULL) {
++		IOLog("POLARIS FINGERPRINT: FPC/Goodix nodes absent; service withheld\n");
++		OSSafeReleaseNULL(fpc);
++		OSSafeReleaseNULL(goodix);
++		return false;
++	}
++	PolarisDriver::publishCommon(this, "Fingerprint", "probe-only", false);
++	PolarisDriver::publishString(this, "CandidateControllers", "FPC1020,Goodix fingerprint");
++	PolarisDriver::publishString(this, "Transport",
++	    "variant-specific bus/IRQ/reset mapping unresolved");
++	PolarisDriver::publishString(this, "SecurityBackend",
++	    "TEE/secure-enrollment protocol not implemented");
++	PolarisDriver::publishNumber(this, "FPCNodePresent", fpc != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "GoodixNodePresent", goodix != NULL ? 1 : 0);
++	setName("PolarisFingerprint");
++	registerService();
++	IOLog("POLARIS FINGERPRINT: FPC=%u Goodix=%u; GPIO/SPI/TEE writes disabled\n",
++	    fpc != NULL ? 1 : 0, goodix != NULL ? 1 : 0);
++	OSSafeReleaseNULL(fpc);
++	OSSafeReleaseNULL(goodix);
++	return true;
++}
++
++extern "C" bool
++PolarisFingerprintStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisFingerprint>(provider, "FINGERPRINT");
++}
++#endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -22,2 +22,6 @@
+ iokit/Kernel/arm/PolarisCamera.cpp                              optional iokitcpp
+ iokit/Kernel/arm/PolarisDrivers.cpp                             optional iokitcpp
++iokit/Kernel/arm/PolarisKeys.cpp                                optional iokitcpp
++iokit/Kernel/arm/PolarisBattery.cpp                             optional iokitcpp
++iokit/Kernel/arm/PolarisNFC.cpp                                 optional iokitcpp
++iokit/Kernel/arm/PolarisFingerprint.cpp                         optional iokitcpp
+diff --git a/iokit/Kernel/arm/PolarisDrivers.cpp b/iokit/Kernel/arm/PolarisDrivers.cpp
+--- a/iokit/Kernel/arm/PolarisDrivers.cpp
++++ b/iokit/Kernel/arm/PolarisDrivers.cpp
+@@ -5,6 +5,10 @@
+ extern "C" bool PolarisWiFiStart(IOService *provider);
+ extern "C" bool PolarisBluetoothStart(IOService *provider);
+ extern "C" bool PolarisCameraStart(IOService *provider);
++extern "C" bool PolarisKeysStart(IOService *provider);
++extern "C" bool PolarisBatteryStart(IOService *provider);
++extern "C" bool PolarisNFCStart(IOService *provider);
++extern "C" bool PolarisFingerprintStart(IOService *provider);
+ 
+ extern "C" void
+ PolarisDriversStart(IOService *provider)
+@@ -17,6 +21,10 @@
+ 	(void)PolarisWiFiStart(provider);
+ 	(void)PolarisBluetoothStart(provider);
+ 	(void)PolarisCameraStart(provider);
++	(void)PolarisKeysStart(provider);
++	(void)PolarisBatteryStart(provider);
++	(void)PolarisNFCStart(provider);
++	(void)PolarisFingerprintStart(provider);
+ 	IOLog("POLARIS DRIVERS: probe services complete; all hardware writes disabled\n");
+ }
+ #endif

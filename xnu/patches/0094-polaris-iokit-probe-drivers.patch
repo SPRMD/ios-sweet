@@ -1,0 +1,563 @@
+diff --git a/iokit/Kernel/arm/PolarisDriverSupport.h b/iokit/Kernel/arm/PolarisDriverSupport.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisDriverSupport.h
+@@ -0,0 +1,79 @@
++/*
++ * Shared support for the Polaris IOKit bring-up services.
++ *
++ * This layer deliberately stops at device-tree/resource discovery.  It does
++ * not copy Android drivers, execute Qualcomm firmware, write MMIO registers,
++ * vote regulators, or create DMA mappings.  The four services are therefore
++ * useful as real XNU/IOKit integration points while their hardware backends
++ * remain opt-in work for later, separately validated patches.
++ */
++#pragma once
++
++#include <stdint.h>
++
++#if defined(POLARIS_DRIVER_HOST_TEST)
++#include "../host/iokit_stubs.hpp"
++#else
++#include <IOKit/IOService.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++#endif
++
++namespace PolarisDriver {
++
++struct ResourceRange {
++	uint64_t address;
++	uint64_t size;
++};
++
++/* The root compatible list must contain both identities before a service can
++ * publish a Polaris hardware object.  This prevents a sweet/K90/raphael DTB
++ * from accidentally matching these drivers. */
++bool boardMatches(void);
++
++IORegistryEntry *nodeAt(const char *path);
++
++/* Decode a DT "reg" property without assuming a particular address-cell
++ * width.  The returned ranges are metadata only; callers must not map them
++ * until a hardware backend has its own ownership proof. */
++unsigned readRanges(IORegistryEntry *node, ResourceRange *ranges, unsigned capacity);
++
++bool bootArgEnabled(const char *name);
++
++void publishCommon(IOService *service, const char *kind, const char *state,
++	bool hardwareWritesEnabled);
++void publishNumber(IOService *service, const char *key, uint64_t value);
++void publishString(IOService *service, const char *key, const char *value);
++
++template <typename Service>
++bool startProbeService(IOService *provider, const char *label)
++{
++	if (provider == NULL) {
++		return false;
++	}
++	Service *service = OSTypeAlloc(Service);
++	if (service == NULL || !service->init() || !service->attach(provider)) {
++		if (service != NULL) {
++			service->release();
++		}
++		IOLog("POLARIS %s: allocation/attach failed\n", label);
++		return false;
++	}
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		IOLog("POLARIS %s: probe did not start\n", label);
++		return false;
++	}
++	service->release();
++	return true;
++}
++
++} /* namespace PolarisDriver */
++
++extern "C" void PolarisDriversStart(IOService *provider);
+diff --git a/iokit/Kernel/arm/PolarisDriverSupport.cpp b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+@@ -0,0 +1,158 @@
++#include "PolarisDriverSupport.h"
++
++#if defined(POLARIS_DRIVER_HOST_TEST)
++#include <stdio.h>
++#include <string.h>
++#else
++extern "C" {
++#include <sys/systm.h>
++}
++#endif
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++namespace PolarisDriver {
++
++static bool
++compatibleContains(OSData *data, const char *wanted)
++{
++	if (data == NULL || wanted == NULL) {
++		return false;
++	}
++	const uint8_t *bytes = static_cast<const uint8_t *>(data->getBytesNoCopy());
++	const unsigned length = static_cast<unsigned>(data->getLength());
++	const unsigned wantedLength = static_cast<unsigned>(strlen(wanted));
++	if (bytes == NULL || length == 0 || wantedLength == 0 || wantedLength >= length) {
++		return false;
++	}
++	for (unsigned offset = 0; offset < length;) {
++		unsigned end = offset;
++		while (end < length && bytes[end] != 0) {
++			end++;
++		}
++		if (end - offset == wantedLength &&
++		    memcmp(bytes + offset, wanted, wantedLength) == 0) {
++			return true;
++		}
++		if (end == length) {
++			break;
++		}
++		offset = end + 1;
++	}
++	return false;
++}
++
++bool
++boardMatches(void)
++{
++	IORegistryEntry *root = nodeAt("/");
++	if (root == NULL) {
++		return false;
++	}
++	OSData *compat = OSDynamicCast(OSData, root->getProperty("compatible"));
++	const bool matches = compatibleContains(compat, "xiaomi,polaris") &&
++	    compatibleContains(compat, "qcom,sdm845");
++	root->release();
++	return matches;
++}
++
++IORegistryEntry *
++nodeAt(const char *path)
++{
++	if (path == NULL) {
++		return NULL;
++	}
++	return IORegistryEntry::fromPath(path, gIODTPlane);
++}
++
++static uint32_t
++be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++	    ((uint32_t)p[2] << 8) | p[3];
++}
++
++unsigned
++readRanges(IORegistryEntry *node, ResourceRange *ranges, unsigned capacity)
++{
++	if (node == NULL || ranges == NULL || capacity == 0) {
++		return 0;
++	}
++	OSData *data = OSDynamicCast(OSData, node->getProperty("reg"));
++	if (data == NULL || data->getBytesNoCopy() == NULL) {
++		return 0;
++	}
++	const uint8_t *bytes = static_cast<const uint8_t *>(data->getBytesNoCopy());
++	const unsigned length = static_cast<unsigned>(data->getLength());
++	unsigned count = 0;
++	/* Polaris DTBs use 32-bit address/size cells for these nodes.  Accept the
++	 * 16-byte form and the 8-byte form, but never guess at truncated cells. */
++	const unsigned stride = length % 16 == 0 ? 16 : (length % 8 == 0 ? 8 : 0);
++	if (stride == 0) {
++		return 0;
++	}
++	for (unsigned offset = 0; offset + stride <= length && count < capacity; offset += stride) {
++		if (stride == 16) {
++			ranges[count].address = ((uint64_t)be32(bytes + offset) << 32) |
++			    be32(bytes + offset + 4);
++			ranges[count].size = ((uint64_t)be32(bytes + offset + 8) << 32) |
++			    be32(bytes + offset + 12);
++		} else {
++			ranges[count].address = be32(bytes + offset);
++			ranges[count].size = be32(bytes + offset + 4);
++		}
++		if (ranges[count].size != 0) {
++			count++;
++		}
++	}
++	return count;
++}
++
++bool
++bootArgEnabled(const char *name)
++{
++	uint32_t value = 0;
++	return name != NULL && PE_parse_boot_argn(name, &value, sizeof(value)) && value == 1;
++}
++
++void
++publishCommon(IOService *service, const char *kind, const char *state,
++	bool hardwareWritesEnabled)
++{
++	if (service == NULL) {
++		return;
++	}
++	publishString(service, "PolarisDriverKind", kind);
++	publishString(service, "PolarisDriverState", state);
++	service->setProperty("HardwareWritesEnabled", hardwareWritesEnabled ?
++	    kOSBooleanTrue : kOSBooleanFalse);
++	service->setProperty("DeviceOperations", "none");
++}
++
++void
++publishNumber(IOService *service, const char *key, uint64_t value)
++{
++	if (service == NULL || key == NULL) {
++		return;
++	}
++	OSNumber *number = OSNumber::withNumber(value, 64);
++	if (number != NULL) {
++		service->setProperty(key, number);
++		number->release();
++	}
++}
++
++void
++publishString(IOService *service, const char *key, const char *value)
++{
++	if (service == NULL || key == NULL || value == NULL) {
++		return;
++	}
++	OSString *string = OSString::withCString(value);
++	if (string != NULL) {
++		service->setProperty(key, string);
++		string->release();
++	}
++}
++
++} /* namespace PolarisDriver */
++#endif
+diff --git a/iokit/Kernel/arm/PolarisGPU.cpp b/iokit/Kernel/arm/PolarisGPU.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisGPU.cpp
+@@ -0,0 +1,49 @@
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisGPU : public IOService
++{
++	OSDeclareDefaultStructors(PolarisGPU);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisGPU, IOService);
++
++bool
++PolarisGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	IORegistryEntry *gpucc = PolarisDriver::nodeAt("/soc/qcom,gpucc@5090000");
++	IORegistryEntry *smmu = PolarisDriver::nodeAt("/soc/arm,smmu-kgsl@5040000");
++	if (gpucc == NULL && smmu == NULL) {
++		IOLog("POLARIS GPU: A630 nodes absent; service withheld\n");
++		OSSafeReleaseNULL(gpucc);
++		OSSafeReleaseNULL(smmu);
++		return false;
++	}
++	PolarisDriver::ResourceRange ranges[2] = {};
++	unsigned rangeCount = gpucc != NULL ? PolarisDriver::readRanges(gpucc, ranges, 2) : 0;
++	PolarisDriver::publishCommon(this, "GPU", "probe-only", false);
++	PolarisDriver::publishString(this, "GPUFamily", "Adreno-A630v2");
++	PolarisDriver::publishString(this, "FirmwareSet", "a630_gmu.bin,a630_sqe.fw,a630_zap.mdt");
++	PolarisDriver::publishString(this, "BringupGate", "polarisgpu=1 remains disabled until PAS13/GMU/SMMU ownership is proven");
++	PolarisDriver::publishNumber(this, "GPUCCResourceCount", rangeCount);
++	PolarisDriver::publishNumber(this, "SMMUPresent", smmu != NULL ? 1 : 0);
++	setName("PolarisGPU");
++	registerService();
++	IOLog("POLARIS GPU: IOKit probe registered; resources=%u, writes disabled\n", rangeCount);
++	OSSafeReleaseNULL(gpucc);
++	OSSafeReleaseNULL(smmu);
++	return true;
++}
++
++extern "C" bool
++PolarisGPUStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisGPU>(provider, "GPU");
++}
++#endif
+diff --git a/iokit/Kernel/arm/PolarisWiFi.cpp b/iokit/Kernel/arm/PolarisWiFi.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisWiFi.cpp
+@@ -0,0 +1,67 @@
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisWiFi : public IOService
++{
++	OSDeclareDefaultStructors(PolarisWiFi);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisWiFi, IOService);
++
++static IORegistryEntry *
++firstNode(const char *const *paths, unsigned count)
++{
++	for (unsigned i = 0; i < count; ++i) {
++		IORegistryEntry *node = PolarisDriver::nodeAt(paths[i]);
++		if (node != NULL) {
++			return node;
++		}
++	}
++	return NULL;
++}
++
++bool
++PolarisWiFi::start(IOService *provider)
++{
++	static const char *const pciePaths[] = {
++		"/soc/qcom,pcie@0x1c00000",
++		"/soc/qcom,pcie@1c00000",
++		"/soc/qcom,pcie@0x1c08000",
++		"/soc/qcom,pcie@1c08000",
++	};
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	IORegistryEntry *pcie = firstNode(pciePaths, sizeof(pciePaths) / sizeof(pciePaths[0]));
++	IORegistryEntry *ipa = PolarisDriver::nodeAt("/soc/qcom,ipa@01e00000/ipa_smmu_wlan");
++	if (pcie == NULL && ipa == NULL) {
++		IOLog("POLARIS WIFI: PCIe/IPA nodes absent; service withheld\n");
++		OSSafeReleaseNULL(pcie);
++		OSSafeReleaseNULL(ipa);
++		return false;
++	}
++	PolarisDriver::ResourceRange ranges[2] = {};
++	unsigned rangeCount = pcie != NULL ? PolarisDriver::readRanges(pcie, ranges, 2) : 0;
++	PolarisDriver::publishCommon(this, "WiFi", "probe-only", false);
++	PolarisDriver::publishString(this, "TransportCandidate", "PCIe + IPA/SMMU (controller status requires overlay confirmation)");
++	PolarisDriver::publishString(this, "FirmwareSet", "wlanmdsp.mbn,bdwlan.bin,WCNSS_qcom_cfg.ini,wlan_mac.bin");
++	PolarisDriver::publishString(this, "FirmwareProtocol", "Qualcomm WLAN; MHI/QRTR not selected on Polaris");
++	PolarisDriver::publishNumber(this, "PCIeResourceCount", rangeCount);
++	PolarisDriver::publishNumber(this, "IPASMMUPresent", ipa != NULL ? 1 : 0);
++	setName("PolarisWiFi");
++	registerService();
++	IOLog("POLARIS WIFI: IOKit probe registered; PCIe resources=%u, writes disabled\n", rangeCount);
++	OSSafeReleaseNULL(pcie);
++	OSSafeReleaseNULL(ipa);
++	return true;
++}
++
++extern "C" bool
++PolarisWiFiStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisWiFi>(provider, "WIFI");
++}
++#endif
+diff --git a/iokit/Kernel/arm/PolarisBluetooth.cpp b/iokit/Kernel/arm/PolarisBluetooth.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisBluetooth.cpp
+@@ -0,0 +1,50 @@
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisBluetooth : public IOService
++{
++	OSDeclareDefaultStructors(PolarisBluetooth);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisBluetooth, IOService);
++
++bool
++PolarisBluetooth::start(IOService *provider)
++{
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	IORegistryEntry *slim = PolarisDriver::nodeAt("/soc/slim@17240000/wcn3990");
++	IORegistryEntry *vendor = PolarisDriver::nodeAt("/vendor/bt_wcn3990");
++	if (slim == NULL && vendor == NULL) {
++		IOLog("POLARIS BT: WCN3990 SlimBus nodes absent; service withheld\n");
++		OSSafeReleaseNULL(slim);
++		OSSafeReleaseNULL(vendor);
++		return false;
++	}
++	PolarisDriver::ResourceRange ranges[2] = {};
++	unsigned rangeCount = slim != NULL ? PolarisDriver::readRanges(slim, ranges, 2) : 0;
++	PolarisDriver::publishCommon(this, "Bluetooth", "probe-only", false);
++	PolarisDriver::publishString(this, "ChipFamily", "Qualcomm WCN3990");
++	PolarisDriver::publishString(this, "Transport", "SlimBus btfmslim_slave");
++	PolarisDriver::publishString(this, "FirmwareSet", "apbtfw10.tlv,apbtfw11.tlv,crbtfw11.tlv,crbtfw20.tlv,crbtfw21.tlv,apnv*.bin,crnv*.bin");
++	PolarisDriver::publishString(this, "BlueToolCompatibility", "not assumed; Apple BlueTool protocol is not a WCN3990 driver");
++	PolarisDriver::publishNumber(this, "SlimBusResourceCount", rangeCount);
++	PolarisDriver::publishNumber(this, "VendorNodePresent", vendor != NULL ? 1 : 0);
++	setName("PolarisBluetooth");
++	registerService();
++	IOLog("POLARIS BT: IOKit probe registered; SlimBus resources=%u, writes disabled\n", rangeCount);
++	OSSafeReleaseNULL(slim);
++	OSSafeReleaseNULL(vendor);
++	return true;
++}
++
++extern "C" bool
++PolarisBluetoothStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisBluetooth>(provider, "BLUETOOTH");
++}
++#endif
+diff --git a/iokit/Kernel/arm/PolarisCamera.cpp b/iokit/Kernel/arm/PolarisCamera.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisCamera.cpp
+@@ -0,0 +1,65 @@
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++class PolarisCamera : public IOService
++{
++	OSDeclareDefaultStructors(PolarisCamera);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(PolarisCamera, IOService);
++
++bool
++PolarisCamera::start(IOService *provider)
++{
++	static const char *const sensors[] = {
++		"/soc/qcom,cci@ac4a000/qcom,cam-sensor@0",
++		"/soc/qcom,cci@ac4a000/qcom,cam-sensor@1",
++		"/soc/qcom,cci@ac4a000/qcom,cam-sensor@2",
++	};
++	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
++		return false;
++	}
++	unsigned sensorCount = 0;
++	for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); ++i) {
++		IORegistryEntry *sensor = PolarisDriver::nodeAt(sensors[i]);
++		if (sensor != NULL) {
++			sensorCount++;
++		}
++		OSSafeReleaseNULL(sensor);
++	}
++	IORegistryEntry *cci = PolarisDriver::nodeAt("/soc/qcom,cci@ac4a000");
++	IORegistryEntry *csiphy = PolarisDriver::nodeAt("/soc/qcom,csiphy@ac65000");
++	IORegistryEntry *csid = PolarisDriver::nodeAt("/soc/qcom,csid0@acb3000");
++	if (sensorCount == 0 && cci == NULL && csiphy == NULL && csid == NULL) {
++		IOLog("POLARIS CAMERA: CCI/CSIPHY/CSID nodes absent; service withheld\n");
++		OSSafeReleaseNULL(cci);
++		OSSafeReleaseNULL(csiphy);
++		OSSafeReleaseNULL(csid);
++		return false;
++	}
++	PolarisDriver::publishCommon(this, "Camera", "probe-only", false);
++	PolarisDriver::publishString(this, "SensorModules", "imx363,ov5675,s5k3m3");
++	PolarisDriver::publishString(this, "SensorOrder", "unknown until per-device EEPROM/DT overlay is confirmed");
++	PolarisDriver::publishString(this, "Pipeline", "CCI -> CSIPHY -> CSID; ISP/IFE and SMMU backend not implemented");
++	PolarisDriver::publishNumber(this, "SensorNodeCount", sensorCount);
++	PolarisDriver::publishNumber(this, "CCIPresent", cci != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "CSIPHYPresent", csiphy != NULL ? 1 : 0);
++	PolarisDriver::publishNumber(this, "CSIDPresent", csid != NULL ? 1 : 0);
++	setName("PolarisCamera");
++	registerService();
++	IOLog("POLARIS CAMERA: IOKit probe registered; sensors=%u, writes disabled\n", sensorCount);
++	OSSafeReleaseNULL(cci);
++	OSSafeReleaseNULL(csiphy);
++	OSSafeReleaseNULL(csid);
++	return true;
++}
++
++extern "C" bool
++PolarisCameraStart(IOService *provider)
++{
++	return PolarisDriver::startProbeService<PolarisCamera>(provider, "CAMERA");
++}
++#endif
+diff --git a/iokit/Kernel/arm/PolarisDrivers.cpp b/iokit/Kernel/arm/PolarisDrivers.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisDrivers.cpp
+@@ -0,0 +1,22 @@
++#include "PolarisDriverSupport.h"
++
++#if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++extern "C" bool PolarisGPUStart(IOService *provider);
++extern "C" bool PolarisWiFiStart(IOService *provider);
++extern "C" bool PolarisBluetoothStart(IOService *provider);
++extern "C" bool PolarisCameraStart(IOService *provider);
++
++extern "C" void
++PolarisDriversStart(IOService *provider)
++{
++	if (provider == NULL || !PolarisDriver::boardMatches()) {
++		return;
++	}
++	IOLog("POLARIS DRIVERS: starting IOKit probe services\n");
++	(void)PolarisGPUStart(provider);
++	(void)PolarisWiFiStart(provider);
++	(void)PolarisBluetoothStart(provider);
++	(void)PolarisCameraStart(provider);
++	IOLog("POLARIS DRIVERS: probe services complete; all hardware writes disabled\n");
++}
++#endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,5 +18,11 @@
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/PolarisDriverSupport.cpp                       optional iokitcpp
++iokit/Kernel/arm/PolarisGPU.cpp                                 optional iokitcpp
++iokit/Kernel/arm/PolarisWiFi.cpp                                optional iokitcpp
++iokit/Kernel/arm/PolarisBluetooth.cpp                           optional iokitcpp
++iokit/Kernel/arm/PolarisCamera.cpp                              optional iokitcpp
++iokit/Kernel/arm/PolarisDrivers.cpp                             optional iokitcpp
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -6,9 +6,11 @@
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
++#include "PolarisDriverSupport.h"
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++extern "C" void PolarisDriversStart(IOService *provider);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -33,6 +35,7 @@
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	PolarisDriversStart(this);
+ 	return true;
+ }
+ 
