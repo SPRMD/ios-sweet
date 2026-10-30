@@ -1,5 +1,14 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Build 4 / Polaris 0098 verification (2026-10-30)
+
+- GitHub Actions run **41001046783** for commit `f4e6f3886757a449a7d4a82b3e4c32aa4df64d76` completed with **success** on `macos-14` (workflow run number 4; `RELEASE`/`SWEET`, `keep_going=false`).
+- The build completed the XNU compile and packaged both artifacts:
+  - `xnu-kernel`, artifact `12953681794`, 53,804,528 bytes, SHA-256 `10f18c9b524e54c46f8af9c057d30cc23eda4f87d8a0ea2ade21c370451aed5b`.
+  - `xnu-buildtree`, artifact `12953248104`, 52,315,303 bytes, SHA-256 `4be4c28a0d1bd58bbc3a11bfe9b1022edd6349aa7cd92c0648ac40ff1583d22a` (expires 2026-11-06).
+- The artifacts are still retained by GitHub, but the public artifact-download endpoint requires an authenticated GitHub session. No kernel artifact has been flashed or used with a phone.
+- Current local branch: `codex/polaris-drivers-0096`; local and fork remotes point to `SPRMD/ios-sweet`. No upstream pull request was opened.
+
 ## Fork handoff (2026-10-30)
 
 - The working fork is `SPRMD/ios-sweet`; the local branch for this bring-up is intended to be `codex/polaris-drivers-0096`.
