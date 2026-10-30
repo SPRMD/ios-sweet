@@ -1,0 +1,112 @@
+diff --git a/iokit/Kernel/arm/PolarisBatteryRevision.h b/iokit/Kernel/arm/PolarisBatteryRevision.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisBatteryRevision.h
+@@ -0,0 +1,46 @@
++/*
++ * Read-only PMI8998 revision identification; no MMIO, power or fuel-gauge
++ * sample operations here. The caller owns the transport and lifetime.
++ */
++#pragma once
++#include <stdint.h>
++
++namespace PolarisBatteryRevision {
++enum Kind { Unknown, Early, V2 };
++typedef bool (*Read)(void *context, uint16_t peripheral, uint8_t reg,
++    uint8_t *bytes, unsigned count);
++struct Result { Kind kind; uint8_t rev4; };
++
++/* qcom,qpnp-revid at SID2 / 0x100: digital major, type and subtype.
++ * Two identical reads are required. Recognize only published PMI8998 rev4
++ * values, rather than treating unspecified earlier values as valid. */
++static inline bool identify(Read read, void *context, Result *out)
++{
++	if (out == 0) return false;
++	out->kind = Unknown;
++	out->rev4 = 0;
++	if (read == 0) return false;
++	uint8_t first[3] = {}, second[3] = {};
++	if (!read(context, 0x201, 0x03, first, 3) ||
++	    !read(context, 0x201, 0x03, second, 3)) return false;
++	for (unsigned i = 0; i < 3; ++i)
++		if (first[i] != second[i]) return false;
++	if (first[1] != 0x51 || first[2] != 0x15) return false;
++	if (first[0] == 1) out->kind = Early;
++	else if (first[0] == 2) out->kind = V2;
++	else return false;
++	out->rev4 = first[0];
++	return true;
++}
++
++/* Explicit byte order from qpnp-fg-gen3; unknown revision fails closed.
++ * Caller handles signed conversion and unit scaling independently. */
++static inline bool decodeWord(Kind kind, uint8_t byte0, uint8_t byte1,
++    uint16_t *out)
++{
++	if (out == 0 || (kind != Early && kind != V2)) return false;
++	*out = kind == Early ? (uint16_t)(((uint16_t)byte0 << 8) | byte1) :
++	    (uint16_t)(((uint16_t)byte1 << 8) | byte0);
++	return true;
++}
++} /* namespace PolarisBatteryRevision */
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+--- a/iokit/Kernel/arm/PolarisBattery.cpp
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -15,6 +15,7 @@
+  * and PMI8998 revisions differ in current/voltage byte order.
+  */
+ #include "PolarisDriverSupport.h"
++#include "PolarisBatteryRevision.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ 
+@@ -94,6 +95,13 @@
+ static const uint8_t kBattInfoVoltage = 0xa0;
+ static const uint8_t kBattInfoCurrent = 0xa2;
+ static const unsigned kNominalCapacityMah = 3400;
++
++static bool
++polarisReadRevision(void *, uint16_t peripheral, uint8_t reg,
++    uint8_t *bytes, unsigned count)
++{
++	return PolarisDriver::spmiRead(peripheral, reg, bytes, count);
++}
+ 
+ /* Do not infer the PMIC revision from the fuel-gauge peripheral subtype or
+  * from plausible voltage values. This gate must be replaced by a validated
+@@ -245,12 +253,24 @@
+ 	PolarisDriver::publishString(this, "ChargerStatus",
+ 	    "not claimed; SMB2 charger remains firmware-owned");
+ 	putBool("PolarisBatteryRevisionVerified", false);
++	const bool revisionRequested = PolarisDriver::bootArgEnabled("polarisbatteryrev");
++	PolarisBatteryRevision::Result revision = {};
++	const bool revisionRecognized = revisionRequested && PolarisDriver::spmiInit() &&
++	    PolarisBatteryRevision::identify(polarisReadRevision, NULL, &revision);
++	PolarisDriver::publishNumber(this, "PolarisBatteryRevisionRecognized", revisionRecognized ? 1 : 0);
++	if (revisionRecognized) {
++		PolarisDriver::publishNumber(this, "PolarisBatteryRevisionMajor", revision.rev4);
++		PolarisDriver::publishString(this, "PolarisBatteryRevisionClass",
++		    revision.kind == PolarisBatteryRevision::Early ? "early; byte-swapped" : "v2; little-endian");
++	}
+ 	if (!PolarisDriver::bootArgEnabled("polarisbattery") ||
+ 	    !polarisBatteryRevisionVerified() || !PolarisDriver::spmiInit()) {
+ 		fReal = false;
+ 		publish(0, 0, 0, 0, false, false);
+ 		PolarisDriver::publishString(this, "PolarisBatteryRevisionState",
+-		    "unknown; hardware sampling disabled");
++		    revisionRecognized ? "recognized; fuel-gauge sampling disabled" :
++		    (revisionRequested ? "revision read failed or unrecognized; fuel-gauge sampling disabled" :
++		    "revision not requested; fuel-gauge sampling disabled"));
+ 	} else {
+ 		fReal = true;
+ 		poll();
+@@ -274,7 +294,8 @@
+ 	PolarisDriver::publishString(this, "PolarisDriverState",
+ 	    fReal ? "read-only SPMI fuel-gauge polling; check sample validity" : "unavailable");
+ 	PolarisDriver::publishString(this, "DeviceOperations",
+-	    fReal ? "SPMI observer reads only" : "none");
++	    fReal ? "SPMI observer reads only" :
++	    (revisionRequested ? "opt-in PMIC revision reads only" : "none"));
+ 	setName("PolarisBattery");
+ 	registerService();
+ 	IOLog("POLARIS BATTERY: %s\\n", fReal ? "read-only polling enabled; check sample validity" : "source unavailable");

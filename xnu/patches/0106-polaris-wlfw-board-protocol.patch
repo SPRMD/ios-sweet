@@ -1,0 +1,101 @@
+diff --git a/iokit/Kernel/arm/PolarisWiFi.cpp b/iokit/Kernel/arm/PolarisWiFi.cpp
+--- a/iokit/Kernel/arm/PolarisWiFi.cpp
++++ b/iokit/Kernel/arm/PolarisWiFi.cpp
+@@ -1,4 +1,5 @@
+ #include "PolarisDriverSupport.h"
++#include "PolarisWlfwProtocol.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ class PolarisWiFi : public IOService
+@@ -26,35 +27,34 @@
+ bool
+ PolarisWiFi::start(IOService *provider)
+ {
+-	static const char *const pciePaths[] = {
+-		"/soc/qcom,pcie@0x1c00000",
+-		"/soc/qcom,pcie@1c00000",
+-		"/soc/qcom,pcie@0x1c08000",
+-		"/soc/qcom,pcie@1c08000",
++	static const char *const wlanPaths[] = {
++		"/soc/qcom,icnss@18800000",
++		"/soc/wifi@18800000",
+ 	};
+ 	if (!IOService::start(provider) || !PolarisDriver::boardMatches()) {
+ 		return false;
+ 	}
+-	IORegistryEntry *pcie = firstNode(pciePaths, sizeof(pciePaths) / sizeof(pciePaths[0]));
++	IORegistryEntry *wlan = firstNode(wlanPaths, sizeof(wlanPaths) / sizeof(wlanPaths[0]));
+ 	IORegistryEntry *ipa = PolarisDriver::nodeAt("/soc/qcom,ipa@01e00000/ipa_smmu_wlan");
+-	if (pcie == NULL && ipa == NULL) {
+-		IOLog("POLARIS WIFI: PCIe/IPA nodes absent; service withheld\n");
+-		OSSafeReleaseNULL(pcie);
++	if (wlan == NULL) {
++		IOLog("POLARIS WIFI: ICNSS node absent; service withheld\n");
+ 		OSSafeReleaseNULL(ipa);
+ 		return false;
+ 	}
+ 	PolarisDriver::ResourceRange ranges[2] = {};
+-	unsigned rangeCount = pcie != NULL ? PolarisDriver::readRanges(pcie, ranges, 2) : 0;
++	unsigned rangeCount = PolarisDriver::readRanges(wlan, ranges, 2);
+ 	PolarisDriver::publishCommon(this, "WiFi", "probe-only", false);
+-	PolarisDriver::publishString(this, "TransportCandidate", "PCIe + IPA/SMMU (controller status requires overlay confirmation)");
++	PolarisDriver::publishString(this, "TransportCandidate", "WCN3990 SNOC/ICNSS; hardware backend not connected");
+ 	PolarisDriver::publishString(this, "FirmwareSet", "wlanmdsp.mbn,bdwlan.bin,WCNSS_qcom_cfg.ini,wlan_mac.bin");
+-	PolarisDriver::publishString(this, "FirmwareProtocol", "Qualcomm WLAN; MHI/QRTR not selected on Polaris");
+-	PolarisDriver::publishNumber(this, "PCIeResourceCount", rangeCount);
++	PolarisDriver::publishString(this, "FirmwareProtocol", "WLFW QMI board-data payload preparation only; no transport");
++	PolarisDriver::publishNumber(this, "WlfwBdfMessageId", PolarisWlfw::kBdfMessage);
++	PolarisDriver::publishNumber(this, "WlfwBdfChunkBytes", PolarisWlfw::kChunkSize);
++	PolarisDriver::publishNumber(this, "ICNSSResourceCount", rangeCount);
+ 	PolarisDriver::publishNumber(this, "IPASMMUPresent", ipa != NULL ? 1 : 0);
+ 	setName("PolarisWiFi");
+ 	registerService();
+-	IOLog("POLARIS WIFI: IOKit probe registered; PCIe resources=%u, writes disabled\n", rangeCount);
+-	OSSafeReleaseNULL(pcie);
++	IOLog("POLARIS WIFI: ICNSS probe registered; resources=%u, writes disabled\n", rangeCount);
++	OSSafeReleaseNULL(wlan);
+ 	OSSafeReleaseNULL(ipa);
+ 	return true;
+ }
+diff --git a/iokit/Kernel/arm/PolarisWlfwProtocol.h b/iokit/Kernel/arm/PolarisWlfwProtocol.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisWlfwProtocol.h
+@@ -0,0 +1,37 @@
++/* WCN3990 WLFW board-data QMI payload helpers; no I/O or hardware access. */
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++
++namespace PolarisWlfw {
++enum { kBdfMessage = 0x25, kChunkSize = 6144, kOverhead = 34 };
++static inline void put16(uint8_t *p, uint16_t n) { p[0]=(uint8_t)n; p[1]=(uint8_t)(n>>8); }
++static inline void put32(uint8_t *p, uint32_t n) { put16(p,(uint16_t)n); put16(p+2,(uint16_t)(n>>16)); }
++static inline uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1]<<8)); }
++/* Produces the QMI TLV body only; caller supplies the transaction header and
++ * must wait for an accepted response before proceeding to the next segment. */
++static inline size_t bdfRequest(const uint8_t *file, size_t total, uint32_t segment,
++                                uint8_t *out, size_t capacity)
++{
++    if (!file || !out || !total || total > UINT32_MAX) return 0;
++    const uint64_t offset=(uint64_t)segment * kChunkSize;
++    if (offset >= total) return 0;
++    const size_t left=total-(size_t)offset;
++    const size_t n=left > kChunkSize ? (size_t)kChunkSize : left;
++    if (capacity < n+kOverhead) return 0;
++    size_t i=0;
++    out[i++]=1; put16(out+i,1); i+=2; out[i++]=1;
++    out[i++]=0x10; put16(out+i,4); i+=2; put32(out+i,0); i+=4;
++    out[i++]=0x11; put16(out+i,4); i+=2; put32(out+i,(uint32_t)total); i+=4;
++    out[i++]=0x12; put16(out+i,4); i+=2; put32(out+i,segment); i+=4;
++    out[i++]=0x13; put16(out+i,(uint16_t)(n+2)); i+=2; put16(out+i,(uint16_t)n); i+=2;
++    for (size_t j=0; j<n; ++j) out[i++]=file[(size_t)offset+j];
++    out[i++]=0x14; put16(out+i,1); i+=2; out[i++]=(n==left)?1:0;
++    return i;
++}
++/* QMI common result TLV, requiring exact length and success. */
++static inline bool bdfAccepted(const uint8_t *p, size_t n)
++{
++    return p && n==7 && p[0]==2 && get16(p+1)==4 && get16(p+3)==0 && get16(p+5)==0;
++}
++}

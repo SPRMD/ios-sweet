@@ -1,0 +1,84 @@
+--- a/iokit/Kernel/arm/PolarisCamera.cpp
++++ b/iokit/Kernel/arm/PolarisCamera.cpp
+@@ -1,4 +1,5 @@
+ #include "PolarisDriverSupport.h"
++#include "PolarisCCIProtocol.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ class PolarisCamera : public IOService
+@@ -29,6 +30,18 @@
+ 			sensorCount++;
+ 		}
+ 		OSSafeReleaseNULL(sensor);
++	}
++	/* Offline-format self-test only: does not access CCI or a sensor. */
++	if (PolarisDriver::bootArgEnabled("polarisccitest")) {
++		const PolarisCCIReadRequest request = {0x1234, 0x50, 2, 2, 3};
++		uint32_t words[POLARIS_CCI_READ_WORDS] = {};
++		uint32_t fifo[] = {0x000201a0}; uint8_t bytes[2] = {};
++		bool ok = PolarisCCIEncodeRead(&request, words, POLARIS_CCI_READ_WORDS) &&
++		    words[0] == 0x30501 && words[1] == 6 && words[2] == 0x34122b &&
++		    words[3] == 0x2a && words[4] == 7 &&
++		    PolarisCCIDecodeRead(fifo, 1, bytes, sizeof(bytes), 2) &&
++		    bytes[0] == 1 && bytes[1] == 2;
++		IOLog("POLARIS CAMERA: CCI format self-test %s; no hardware access\n", ok ? "passed" : "failed");
+ 	}
+ 	IORegistryEntry *cci = PolarisDriver::nodeAt("/soc/qcom,cci@ac4a000");
+ 	IORegistryEntry *csiphy = PolarisDriver::nodeAt("/soc/qcom,csiphy@ac65000");
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisCCIProtocol.h
+@@ -0,0 +1,54 @@
++/*
++ * Polaris CCI command encoding only. No MMIO, bus I/O, DMA, or power control.
++ * Derived from the command layout in MiCode polaris-o-oss cam_cci_core.c and
++ * cam_cci_dev.h; see README_CN.md for source and limitations.
++ */
++#ifndef POLARIS_CCI_PROTOCOL_H
++#define POLARIS_CCI_PROTOCOL_H
++#include <stdint.h>
++
++enum { POLARIS_CCI_READ_WORDS = 5, POLARIS_CCI_MAX_READ = 12 };
++struct PolarisCCIReadRequest {
++    uint32_t registerAddress;
++    uint8_t slaveAddress7; /* seven-bit SID, never an eight-bit wire address */
++    uint8_t registerAddressBytes; /* 1..3; four-byte form intentionally rejected */
++    uint8_t readBytes; /* one hardware transaction, 1..12 */
++    uint8_t retries; /* 0..3 */
++};
++
++/* Only id_map=0. Output remains unchanged if validation fails. */
++static inline bool PolarisCCIEncodeRead(const struct PolarisCCIReadRequest *r,
++                                       uint32_t *words, uint32_t capacity)
++{
++    if (!r || !words || capacity < POLARIS_CCI_READ_WORDS || r->slaveAddress7 > 0x7f ||
++        r->registerAddressBytes < 1 || r->registerAddressBytes > 3 ||
++        r->readBytes < 1 || r->readBytes > POLARIS_CCI_MAX_READ || r->retries > 3 ||
++        (r->registerAddress >> (r->registerAddressBytes * 8)) != 0) return false;
++    uint32_t addressWord = 11u | ((uint32_t)r->registerAddressBytes << 4);
++    for (uint32_t i = 0; i < r->registerAddressBytes; ++i)
++        addressWord |= ((r->registerAddress >> (8 * i)) & 0xffu) <<
++                       (8 * (r->registerAddressBytes - i));
++    uint32_t out[POLARIS_CCI_READ_WORDS] = {
++        1u | ((uint32_t)r->slaveAddress7 << 4) | ((uint32_t)r->retries << 16),
++        6u, addressWord, 10u | ((uint32_t)r->readBytes << 4), 7u
++    };
++    for (unsigned i = 0; i < POLARIS_CCI_READ_WORDS; ++i) words[i] = out[i];
++    return true;
++}
++
++/* MiCode drops the FIFO's first byte (SID), then consumes LE words. */
++static inline bool PolarisCCIDecodeRead(const uint32_t *words, uint32_t wordCount,
++                                       uint8_t *data, uint32_t dataCapacity,
++                                       uint32_t requestedBytes)
++{
++    if (!words || !data || requestedBytes < 1 || requestedBytes > POLARIS_CCI_MAX_READ ||
++        dataCapacity < requestedBytes || wordCount != requestedBytes / 4u + 1u) return false;
++    uint8_t result[POLARIS_CCI_MAX_READ];
++    for (uint32_t i = 0; i < requestedBytes; ++i) {
++        uint32_t sourceByte = i + 1u;
++        result[i] = (uint8_t)(words[sourceByte / 4u] >> (8u * (sourceByte % 4u)));
++    }
++    for (uint32_t i = 0; i < requestedBytes; ++i) data[i] = result[i];
++    return true;
++}
++#endif
