@@ -1,0 +1,13 @@
+diff --git a/iokit/Kernel/arm/PolarisDriverSupport.cpp b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+--- a/iokit/Kernel/arm/PolarisDriverSupport.cpp
++++ b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+@@ -12,6 +12,10 @@ extern "C" {
+ #include <machine/machine_routines.h>
+ #endif
+ 
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++#endif
++
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ namespace PolarisDriver {
