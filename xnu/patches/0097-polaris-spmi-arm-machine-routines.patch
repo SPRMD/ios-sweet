@@ -1,0 +1,11 @@
+diff --git a/iokit/Kernel/arm/PolarisDriverSupport.cpp b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+--- a/iokit/Kernel/arm/PolarisDriverSupport.cpp
++++ b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+@@ -8,6 +8,7 @@ extern "C" {
+ #include <sys/systm.h>
+ }
+ #include <IOKit/IOLocks.h>
++#include <arm/machine_routines.h>
+ #include <mach/mach_types.h>
+ #include <machine/machine_routines.h>
+ #endif
