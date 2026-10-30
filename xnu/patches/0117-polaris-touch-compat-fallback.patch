@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+index 23274ac..a9776c1 100644
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -44,6 +44,7 @@ static bool pt_started;
+ static bool pt_hid_enabled;
+ static bool pt_reset_enabled;
+ static bool pt_identity_enabled;
++static bool pt_compat_enabled;
+ static bool pt_down[MAX_FINGERS];
+ static int pt_x[MAX_FINGERS], pt_y[MAX_FINGERS];
+ static unsigned pt_fingers;
+@@ -440,23 +441,28 @@ pt_thread(void *arg __unused, wait_result_t result __unused)
+ 			    identity[14], identity[15], identity[16], identity[17],
+ 			    identity[18], identity[19], identity[20]);
+ 		} else {
+-			printf("POLARIS I2C: F01 identity read failed stage=%u reason=%u; stopping\n",
++			/* Identity is diagnostic only.  A firmware variant may expose a
++			 * shorter or gated F01 query while the already verified F12 path
++			 * remains usable, so never make this optional read fatal. */
++			printf("POLARIS I2C: F01 identity read failed stage=%u reason=%u; continuing\n",
+ 			    pt_read_stage, pt_read_failure);
+-			goto restore;
+ 		}
+ 	}
+ 	printf("POLARIS I2C: PDT F01 %02x %02x %02x %02x %02x %02x F12 %02x %02x %02x %02x %02x %02x\n",
+ 	    f01[0], f01[1], f01[2], f01[3], f01[4], f01[5],
+ 	    f12[0], f12[1], f12[2], f12[3], f12[4], f12[5]);
+ 	uint8_t f01_status[2] = {0}, f01_ctrl = 0;
+-	if (!pt_read(f01[3], f01_status, sizeof(f01_status)) ||
+-	    !pt_read(f01[2], &f01_ctrl, 1)) {
+-		printf("POLARIS I2C: F01 status/control read failed stage=%u reason=%u\n",
++	bool f01_state_ok = pt_read(f01[3], f01_status, sizeof(f01_status)) &&
++	    pt_read(f01[2], &f01_ctrl, 1);
++	if (!f01_state_ok) {
++		/* This read is a health diagnostic, not a prerequisite for the
++		 * known-good F12 frame format.  Keep the HID path alive. */
++		printf("POLARIS I2C: F01 status/control read failed stage=%u reason=%u; continuing\n",
+ 		    pt_read_stage, pt_read_failure);
+-		goto restore;
++	} else {
++		printf("POLARIS I2C: F01 device=0x%02x irq=0x%02x control=0x%02x (configured=%u)\n",
++		    f01_status[0], f01_status[1], f01_ctrl, (f01_ctrl >> 7) & 1u);
+ 	}
+-	printf("POLARIS I2C: F01 device=0x%02x irq=0x%02x control=0x%02x (configured=%u)\n",
+-	    f01_status[0], f01_status[1], f01_ctrl, (f01_ctrl >> 7) & 1u);
+ 	if (!pt_read(f12[0], query, sizeof(query))) {
+ 		printf("POLARIS I2C: F12 raw query read failed\n");
+ 		goto restore;
+@@ -478,6 +484,14 @@ pt_thread(void *arg __unused, wait_result_t result __unused)
+ 			if (report_mask == 0xffu) {
+ 				pt_fingers = reported;
+ 				printf("POLARIS HID: Ctrl23 confirmed %u slots, 8-byte report\n", pt_fingers);
++			} else if (pt_compat_enabled) {
++				/* Ctrl28 is not yet proven on every S3330 firmware variant.
++				 * In explicit compatibility mode keep the shim-observed
++				 * one-slot frame, never write Ctrl28, and avoid guessing a
++				 * multi-slot layout. */
++				pt_fingers = 1;
++				printf("POLARIS HID: Ctrl28=0x%02x is unverified; compatibility one-slot fallback\n",
++				    report_mask);
+ 			} else {
+ 				printf("POLARIS HID: Ctrl28 is not 8-byte report; refusing HID\n");
+ 				goto restore;
+@@ -584,7 +598,8 @@ done:
+ void
+ polaris_touch_i2c_init(void)
+ {
+-	int enabled = 0, hid_enabled = 0, reset_enabled = 0, identity_enabled = 0;
++	int enabled = 0, hid_enabled = 0, reset_enabled = 0, identity_enabled = 0,
++	    compat_enabled = 0;
+ 	thread_t thread;
+ 	if (!polaris_touch_i2c_board()) {
+ 		return;
+@@ -593,6 +608,7 @@ polaris_touch_i2c_init(void)
+ 	(void)PE_parse_boot_argn("polaristouchhid", &hid_enabled, sizeof(hid_enabled));
+ 	(void)PE_parse_boot_argn("polaristouchreset", &reset_enabled, sizeof(reset_enabled));
+ 	(void)PE_parse_boot_argn("polaristouchid", &identity_enabled, sizeof(identity_enabled));
++	(void)PE_parse_boot_argn("polaristouchcompat", &compat_enabled, sizeof(compat_enabled));
+ 	if ((enabled != 1 && hid_enabled != 1) || pt_started) {
+ 		return;
+ 	}
+@@ -600,8 +616,10 @@ polaris_touch_i2c_init(void)
+ 	pt_hid_enabled = hid_enabled == 1;
+ 	pt_reset_enabled = reset_enabled == 1;
+ 	pt_identity_enabled = identity_enabled == 1;
+-	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype; HID %s reset99 %s\n",
+-	    pt_hid_enabled ? "EXPERIMENTAL" : "off", pt_reset_enabled ? "release" : "unchanged");
++	pt_compat_enabled = compat_enabled == 1;
++	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype; HID %s reset99 %s identity %s compat %s\n",
++	    pt_hid_enabled ? "EXPERIMENTAL" : "off", pt_reset_enabled ? "release" : "unchanged",
++	    pt_identity_enabled ? "on" : "off", pt_compat_enabled ? "on" : "off");
+ 	kern_return_t kr = kernel_thread_start(pt_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+
+
