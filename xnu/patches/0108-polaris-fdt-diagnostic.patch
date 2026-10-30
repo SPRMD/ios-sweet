@@ -1,0 +1,162 @@
+--- a/iokit/Kernel/arm/PolarisDrivers.cpp
++++ b/iokit/Kernel/arm/PolarisDrivers.cpp
+@@ -1,4 +1,35 @@
+ #include "PolarisDriverSupport.h"
++
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "polaris_fdt.h"
++
++/* Opt-in, read-only diagnostics. This does not instantiate device drivers. */
++static void PolarisFDTDiagnose(void)
++{
++    if (!PolarisDriver::bootArgEnabled("polarisfdt")) return;
++    DTEntry root = NULL; const void *slot = NULL; unsigned int slotSize = 0;
++    if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++        SecureDTGetProperty(root, "polaris-abl-fdt", &slot, &slotSize) != kSuccess ||
++        slot == NULL || slotSize != PFDT_MAX_SIZE + 4u) {
++        IOLog("POLARIS FDT: transport absent\n"); return;
++    }
++    const uint8_t *p = static_cast<const uint8_t *>(slot);
++    uint32_t n = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++    struct pfdt_view v; const volatile uint8_t *value; uint32_t len; int found;
++    if (!n || n > PFDT_MAX_SIZE || !pfdt_init(&v, p + 4, n) || v.total != n ||
++        !pfdt_lookup(&v, "/", NULL, &value, &len, &found) || !found) {
++        IOLog("POLARIS FDT: invalid or empty transport\n"); return;
++    }
++    static const char *const paths[] = { "/soc", "/vendor", "/soc/qcom,icnss@18800000" };
++    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
++        if (!pfdt_lookup(&v, paths[i], NULL, &value, &len, &found)) {
++            IOLog("POLARIS FDT: parse failed\n"); return;
++        }
++        IOLog("POLARIS FDT: %s %s\n", paths[i], found ? "present" : "absent");
++    }
++}
++
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ extern "C" bool PolarisGPUStart(IOService *provider);
+@@ -16,6 +47,7 @@
+ 	if (provider == NULL || !PolarisDriver::boardMatches()) {
+ 		return;
+ 	}
++	PolarisFDTDiagnose();
+ 	IOLog("POLARIS DRIVERS: starting Polaris IOKit services\n");
+ 	(void)PolarisGPUStart(provider);
+ 	(void)PolarisWiFiStart(provider);
+--- /dev/null
++++ b/iokit/Kernel/arm/polaris_fdt.h
+@@ -0,0 +1,113 @@
++/* Bounded, read-only FDT validator and property lookup. No hardware access. */
++#ifndef POLARIS_FDT_H
++#define POLARIS_FDT_H
++#include <stddef.h>
++#include <stdint.h>
++
++#define PFDT_MAX_SIZE (1024u * 1024u)
++#define PFDT_MAX_DEPTH 64u
++#define PFDT_MAX_PATH 1024u
++struct pfdt_view { const volatile uint8_t *b; uint32_t total, so, sl, no, nl; };
++
++static uint32_t pfdt_u32(const volatile uint8_t *p) {
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++static int pfdt_range(uint32_t pos, uint32_t len, uint32_t limit) {
++    return pos <= limit && len <= limit - pos;
++}
++static int pfdt_string(const volatile uint8_t *p, uint32_t available, uint32_t *length) {
++    uint32_t i;
++    for (i = 0; i < available; ++i) if (!p[i]) { *length = i; return 1; }
++    return 0;
++}
++static int pfdt_equal(const volatile uint8_t *p, uint32_t n, const char *s) {
++    uint32_t i = 0;
++    while (i < n && s[i] && p[i] == (uint8_t)s[i]) ++i;
++    return i == n && s[i] == 0;
++}
++
++/* available must be an actual accessible buffer extent, not a header claim. */
++static int pfdt_init(struct pfdt_view *v, const volatile void *buffer, uint32_t available) {
++    const volatile uint8_t *b = (const volatile uint8_t *)buffer;
++    if (!v || !b || available < 40 || pfdt_u32(b) != 0xd00dfeedu) return 0;
++    uint32_t total = pfdt_u32(b + 4), version = pfdt_u32(b + 20);
++    uint32_t compatible = pfdt_u32(b + 24);
++    if (total < 40 || total > available || total > PFDT_MAX_SIZE || version < 17 ||
++        compatible > 17 || compatible > version) return 0;
++    uint32_t so = pfdt_u32(b + 8), no = pfdt_u32(b + 12);
++    uint32_t sl = pfdt_u32(b + 36), nl = pfdt_u32(b + 32);
++    if ((so & 3u) || so < 40 || no < 40 || !pfdt_range(so, sl, total) ||
++        !pfdt_range(no, nl, total) || sl < 12 || !nl ||
++        (so < no + nl && no < so + sl)) return 0;
++    v->b = b; v->total = total; v->so = so; v->sl = sl; v->no = no; v->nl = nl;
++    return 1;
++}
++
++/* Validates the entire structure even when requested property is found early.
++ * Returns 1 for a valid tree, 0 for malformed input. found=0 means absent.
++ * Exact paths only; key == NULL tests node presence. Duplicates fail closed.
++ */
++static int pfdt_lookup(const struct pfdt_view *v, const char *path, const char *key,
++                       const volatile uint8_t **value, uint32_t *size, int *found) {
++    char current[PFDT_MAX_PATH];
++    uint32_t positions[PFDT_MAX_DEPTH], used = 0, depth = 0, roots = 0;
++    uint32_t pos = 0; int hit = 0, closed = 0;
++    const volatile uint8_t *result = 0; uint32_t result_size = 0;
++    if (!v || !path || !value || !size || !found) return 0;
++    current[0] = 0;
++    while (pfdt_range(pos, 4, v->sl)) {
++        uint32_t tok = pfdt_u32(v->b + v->so + pos); pos += 4;
++        if (tok == 1) {
++            uint32_t n;
++            if (closed || depth >= PFDT_MAX_DEPTH ||
++                !pfdt_string(v->b + v->so + pos, v->sl - pos, &n)) return 0;
++            if (!depth) { if (n || roots++) return 0; }
++            else if (!n || used + 1u + n >= PFDT_MAX_PATH) return 0;
++            positions[depth++] = used;
++            if (depth > 1) {
++                current[used++] = '/';
++                for (uint32_t i = 0; i < n; ++i) {
++                    uint8_t c = v->b[v->so + pos + i];
++                    if (c == '/') return 0;
++                    current[used++] = (char)c;
++                }
++                current[used] = 0;
++            }
++            if (!key && ((depth == 1 && path[0] == '/' && path[1] == 0) ||
++                (depth > 1 && pfdt_equal((const volatile uint8_t *)current, used, path)))) {
++                if (hit) return 0;
++                hit = 1;
++            }
++            if (n > UINT32_MAX - 4u) return 0;
++            uint32_t advance = (n + 4u) & ~3u;
++            if (!pfdt_range(pos, advance, v->sl)) return 0;
++            pos += advance;
++        } else if (tok == 2) {
++            if (!depth) return 0;
++            used = positions[--depth]; current[used] = 0;
++            if (!depth) closed = 1;
++        } else if (tok == 3) {
++            if (!depth || !pfdt_range(pos, 8, v->sl)) return 0;
++            uint32_t n = pfdt_u32(v->b + v->so + pos);
++            uint32_t noff = pfdt_u32(v->b + v->so + pos + 4), namelen;
++            pos += 8;
++            if (noff >= v->nl || !pfdt_string(v->b + v->no + noff, v->nl - noff, &namelen) ||
++                !namelen || n > UINT32_MAX - 3u || !pfdt_range(pos, (n + 3u) & ~3u, v->sl)) return 0;
++            if (key && ((depth == 1 && path[0] == '/' && path[1] == 0) ||
++                 (depth > 1 && pfdt_equal((const volatile uint8_t *)current, used, path))) &&
++                pfdt_equal(v->b + v->no + noff, namelen, key)) {
++                if (hit) return 0;
++                result = v->b + v->so + pos; result_size = n; hit = 1;
++            }
++            pos += (n + 3u) & ~3u;
++        } else if (tok == 4) {
++            continue;
++        } else if (tok == 9) {
++            if (!closed || depth || roots != 1) return 0;
++            *value = result; *size = result_size; *found = hit;
++            return 1;
++        } else return 0;
++    }
++    return 0;
++}
++#endif

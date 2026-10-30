@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/PolarisWiFi.cpp b/iokit/Kernel/arm/PolarisWiFi.cpp
+--- a/iokit/Kernel/arm/PolarisWiFi.cpp
++++ b/iokit/Kernel/arm/PolarisWiFi.cpp
+@@ -1,5 +1,6 @@
+ #include "PolarisDriverSupport.h"
+ #include "PolarisWlfwProtocol.h"
++#include "PolarisCopyEngine.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ class PolarisWiFi : public IOService
+@@ -49,6 +50,16 @@
+ 	PolarisDriver::publishString(this, "FirmwareProtocol", "WLFW QMI board-data payload preparation only; no transport");
+ 	PolarisDriver::publishNumber(this, "WlfwBdfMessageId", PolarisWlfw::kBdfMessage);
+ 	PolarisDriver::publishNumber(this, "WlfwBdfChunkBytes", PolarisWlfw::kChunkSize);
++	PolarisDriver::publishString(this, "CopyEngineState", "offline ring logic; DMA and MMIO disconnected");
++	if (PolarisDriver::bootArgEnabled("polariscecheck")) {
++		uint8_t scratch[PolarisCE::kDescriptorBytes * 2] = {};
++		PolarisCE::SourceRing ring = {};
++		bool ok = ring.init(scratch, sizeof(scratch), 2, 64) &&
++		    ring.enqueue(0x1000, 64, 1) && ring.queued() == 1 &&
++		    ring.retireTo(1) && ring.queued() == 0;
++		PolarisDriver::publishNumber(this, "CopyEngineOfflineSelfTest", ok ? 1 : 0);
++		IOLog("POLARIS WIFI: offline CE ring self-test %s; no hardware access\n", ok ? "passed" : "failed");
++	}
+ 	PolarisDriver::publishNumber(this, "ICNSSResourceCount", rangeCount);
+ 	PolarisDriver::publishNumber(this, "IPASMMUPresent", ipa != NULL ? 1 : 0);
+ 	setName("PolarisWiFi");
+diff --git a/iokit/Kernel/arm/PolarisCopyEngine.h b/iokit/Kernel/arm/PolarisCopyEngine.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisCopyEngine.h
+@@ -0,0 +1,47 @@
++/* WCN3990 CE source ring preparation. No DMA ownership, MMIO or barriers. */
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++
++namespace PolarisCE {
++enum { kDescriptorBytes = 16, kMaximumEntries = 4096 };
++static inline void put16(uint8_t *p, uint16_t n) { p[0]=(uint8_t)n; p[1]=(uint8_t)(n>>8); }
++static inline void put32(uint8_t *p, uint32_t n) { put16(p,(uint16_t)n); put16(p+2,(uint16_t)(n>>16)); }
++
++/* The caller must serialize all operations. Storage is ordinary caller-owned
++ * memory; it is not mapped to a device, and no hardware index is written. */
++struct SourceRing {
++    uint8_t *descriptors;
++    uint32_t count, read, write;
++    uint16_t maxBytes;
++    bool init(uint8_t *storage, size_t bytes, uint32_t entries, uint16_t maxLen) {
++        if (!storage || entries < 2 || entries > kMaximumEntries ||
++            (entries & (entries-1)) || bytes < (size_t)entries*kDescriptorBytes || !maxLen)
++            return false;
++        descriptors=storage; count=entries; read=0; write=0; maxBytes=maxLen;
++        for (size_t i=0; i<(size_t)entries*kDescriptorBytes; ++i) storage[i]=0;
++        return true;
++    }
++    uint32_t queued() const { return (write-read) & (count-1); }
++    bool enqueue(uint64_t dmaAddress, uint16_t length, uint16_t transferId) {
++        if (!descriptors || count < 2 || !length || length > maxBytes ||
++            dmaAddress > (UINT64_C(1)<<35) - length || transferId > 0xfff ||
++            ((write+1)&(count-1)) == read) return false;
++        uint8_t *d=descriptors+(size_t)write*kDescriptorBytes;
++        put32(d,(uint32_t)dmaAddress); put32(d+4,(uint32_t)(dmaAddress>>32));
++        put16(d+8,length); put16(d+10,(uint16_t)(transferId<<4)); put32(d+12,0);
++        write=(write+1)&(count-1); return true;
++    }
++    /* Accept only a completion index within the currently queued interval. */
++    bool retireTo(uint32_t hardwareIndex) {
++        if (!descriptors || count < 2 || hardwareIndex >= count) return false;
++        uint32_t completed=(hardwareIndex-read)&(count-1);
++        if (completed > queued()) return false;
++        for (uint32_t i=0; i<completed; ++i) {
++            uint8_t *d=descriptors+(size_t)read*kDescriptorBytes;
++            put16(d+8,0); read=(read+1)&(count-1);
++        }
++        return true;
++    }
++};
++}

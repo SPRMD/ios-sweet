@@ -1,0 +1,164 @@
+diff --git a/iokit/Kernel/arm/PolarisSPMI.h b/iokit/Kernel/arm/PolarisSPMI.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisSPMI.h
+@@ -0,0 +1,36 @@
++/* Bounded, read-only SPMI arbiter-v5 request helpers for Polaris. */
++#pragma once
++#include <stdint.h>
++
++namespace PolarisSPMI {
++static inline unsigned mapCount(unsigned coreSize)
++{
++	if (coreSize <= 0x900U || (coreSize - 0x900U) % 4U != 0) return 0;
++	unsigned count = (coreSize - 0x900U) / 4U;
++	return count <= 512U ? count : 0;
++}
++
++/* Only the specific observer reads used by the keys and fuel-gauge
++ * prototypes are admitted. Extend only with independently checked source. */
++static inline bool permitted(uint16_t peripheral, uint8_t reg, unsigned count)
++{
++	if (count == 0 || count > 8 || (unsigned)reg + count > 256) return false;
++	if (peripheral == 0x008 && count == 1)
++		return reg == 0x04 || reg == 0x05 || reg == 0x10;
++	if (peripheral == 0x0c5 && count == 1)
++		return reg == 0x04 || reg == 0x05 || reg == 0x10 ||
++		    reg == 0x40 || reg == 0x42 || reg == 0x46;
++	if (peripheral == 0x201) return reg == 0x03 && count == 3;
++	if (peripheral == 0x240)
++		return (reg == 0x05 && count == 1) || (reg == 0x09 && count == 2);
++	if (peripheral == 0x241)
++		return (reg == 0x05 && count == 1) ||
++		    (count == 2 && (reg == 0x50 || reg == 0xa0 || reg == 0xa2));
++	return false;
++}
++
++static inline uint32_t readCommand(uint8_t reg, unsigned count)
++{
++	return (1U << 27) | ((uint32_t)reg << 4) | (count - 1U);
++}
++} /* namespace PolarisSPMI */
+diff --git a/iokit/Kernel/arm/PolarisFuelGauge.h b/iokit/Kernel/arm/PolarisFuelGauge.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisFuelGauge.h
+@@ -0,0 +1,34 @@
++/* PMI8998 Gen3 raw-to-physical conversions, based on MiCode polaris-o-oss.
++ * No I/O and no iOS charging-state or current-sign interpretation. */
++#pragma once
++#include "PolarisBatteryRevision.h"
++
++namespace PolarisFuelGauge {
++struct Sample {
++	unsigned percent;
++	unsigned millivolts;
++	int currentMicroamps; /* Qualcomm driver convention, not iOS polarity. */
++	int temperatureDeciCelsius;
++};
++
++static inline bool convert(PolarisBatteryRevision::Kind revision,
++    const uint8_t soc[2], const uint8_t voltage[2], const uint8_t current[2],
++    const uint8_t temperature[2], Sample *out)
++{
++	if (!soc || !voltage || !current || !temperature || !out || soc[0] != soc[1])
++		return false;
++	uint16_t v = 0, i = 0;
++	if (!PolarisBatteryRevision::decodeWord(revision, voltage[0], voltage[1], &v) ||
++	    !PolarisBatteryRevision::decodeWord(revision, current[0], current[1], &i))
++		return false;
++	const int signedCurrent = i & 0x8000U ? (int)i - 65536 : (int)i;
++	const unsigned tempRaw = ((unsigned)(temperature[1] & 7U) << 8) | temperature[0];
++	Sample value = {};
++	value.percent = ((unsigned)soc[0] * 100U + 127U) / 255U;
++	value.millivolts = (unsigned)(((uint64_t)v * 122070ULL) / 1000000ULL);
++	value.currentMicroamps = (int)(((int64_t)signedCurrent * 488281LL) / 1000LL);
++	value.temperatureDeciCelsius = ((int)((tempRaw + 2U) / 4U) - 273) * 10;
++	*out = value;
++	return true;
++}
++} /* namespace PolarisFuelGauge */
+diff --git a/iokit/Kernel/arm/PolarisDriverSupport.cpp b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+--- a/iokit/Kernel/arm/PolarisDriverSupport.cpp
++++ b/iokit/Kernel/arm/PolarisDriverSupport.cpp
+@@ -1,4 +1,5 @@
+ #include "PolarisDriverSupport.h"
++#include "PolarisSPMI.h"
+ 
+ #if defined(POLARIS_DRIVER_HOST_TEST)
+ #include <stdio.h>
+@@ -26,20 +27,18 @@
+  * application processor's read-only view.  The only store in this backend is
+  * an EXT_READL command; PMIC configuration and interrupt state are untouched. */
+ #define POLARIS_SPMI_CORE_PA       0x0c440000UL
+-#define POLARIS_SPMI_CORE_SIZE     0x2000UL
++#define POLARIS_SPMI_CORE_SIZE     0x1100UL /* stock Polaris DTB resource */
+ #define POLARIS_SPMI_CNFG_PA       0x0c40a000UL
+ #define POLARIS_SPMI_CNFG_SIZE     0x1000UL
+ #define POLARIS_SPMI_OBSERVER_PA   0x0e600000UL
+ #define POLARIS_SPMI_OBSERVER_SIZE 0x10000UL
+ #define POLARIS_SPMI_VERSION       0x000
+-#define POLARIS_SPMI_FEATURES      0x004
+ #define POLARIS_SPMI_CHANNEL(n)    (0x900U + 4U * (n))
+ #define POLARIS_SPMI_OWNER(n)      (0x700U + 4U * (n))
+ #define POLARIS_SPMI_OBS_COMMAND   0x00
+ #define POLARIS_SPMI_OBS_STATUS    0x08
+ #define POLARIS_SPMI_OBS_DATA0     0x18
+ #define POLARIS_SPMI_OBS_DATA1     0x1c
+-#define POLARIS_SPMI_READ          (1U << 27)
+ #define POLARIS_SPMI_DONE          0x01
+ #define POLARIS_SPMI_ERROR_MASK    0x0e
+ #define POLARIS_SPMI_MAX_CHANNELS  512U
+@@ -194,6 +193,9 @@
+ #if defined(POLARIS_DRIVER_HOST_TEST)
+ 	return true;
+ #else
++	if (!boardMatches()) {
++		return false;
++	}
+ 	if (gSpmiAttempted) {
+ 		return gSpmiReady;
+ 	}
+@@ -212,7 +214,9 @@
+ 		return false;
+ 	}
+ 	uint32_t version = spmiReadMMIO(gSpmiCore, POLARIS_SPMI_VERSION);
+-	gSpmiCount = spmiReadMMIO(gSpmiCore, POLARIS_SPMI_FEATURES) & 0x7ffU;
++	/* 0x004 is INT_EN, not the channel count. v5 derives its map length
++	 * from the core resource; 0x1100 is the stock DTB's core size. */
++	gSpmiCount = PolarisSPMI::mapCount(POLARIS_SPMI_CORE_SIZE);
+ 	if (version < 0x50000000U || version >= 0x70000000U ||
+ 	    gSpmiCount == 0 || gSpmiCount > POLARIS_SPMI_MAX_CHANNELS) {
+ 		IOLog("POLARIS SPMI: unsupported arbiter version=%#x channels=%u\\n",
+@@ -242,8 +246,8 @@
+ 	(void)count;
+ 	return false;
+ #else
+-	if (!gSpmiReady || gSpmiLock == NULL || bytes == NULL || count == 0 ||
+-	    count > 8 || peripheralId >= sizeof(gSpmiApid) / sizeof(gSpmiApid[0])) {
++	if (!gSpmiReady || gSpmiLock == NULL || bytes == NULL ||
++	    !PolarisSPMI::permitted(peripheralId, reg, count)) {
+ 		return false;
+ 	}
+ 	IOLockLock(gSpmiLock);
+@@ -258,8 +262,7 @@
+ 		return false;
+ 	}
+ 	const uint32_t lane = 0x80U * apid;
+-	const uint32_t command = POLARIS_SPMI_READ |
+-	    ((uint32_t)reg << 4) | (count - 1U);
++	const uint32_t command = PolarisSPMI::readCommand(reg, count);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(gSpmiObserver + lane + POLARIS_SPMI_OBS_COMMAND) = command;
+ 	__asm__ volatile("dsb osh" ::: "memory");
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+--- a/iokit/Kernel/arm/PolarisBattery.cpp
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -16,6 +16,7 @@
+  */
+ #include "PolarisDriverSupport.h"
+ #include "PolarisBatteryRevision.h"
++#include "PolarisFuelGauge.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ 

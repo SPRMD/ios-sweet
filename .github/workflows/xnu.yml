@@ -72,7 +72,15 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee "$RUNNER_TEMP/xnu-build.log"
+          # The upstream builder warns and continues when a patch cannot apply.
+          # Our numbered patches are required, unlike version-specific upstream patches.
+          if grep -E 'Skipping patch .*/[0-9]{4}-[^/]*\.patch' "$RUNNER_TEMP/xnu-build.log"; then
+            echo 'A required project patch was skipped.' >&2
+            exit 1
+          fi
 
       - name: Package build tree for local compiles
         if: always()

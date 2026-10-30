@@ -7,6 +7,7 @@ Checks:
   1. Patch sequence in xnu/patches/:
      - Sequential numbering starting at 0001 with no duplicates or gaps.
      - Patch files are non-empty and have valid unified diff markers.
+     - Patches use LF line endings, matching the upstream source files.
   2. Python script syntax:
      - All tools/*.py compile cleanly via py_compile.
   3. Shell script syntax:
@@ -48,6 +49,10 @@ def validate_patches(verbose=False):
         if size == 0:
             errors.append(f"Patch is empty: {fname}")
             continue
+
+        with open(path, 'rb') as f:
+            if b'\r' in f.read():
+                errors.append(f"Patch contains CR bytes; use LF line endings: {fname}")
 
         with open(path, 'r', errors='ignore') as f:
             head = f.read(2048)
