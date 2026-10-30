@@ -1,12 +1,21 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Local Polaris handoff (2026-10-30)
+
+- Git Credential Manager authenticated as `SPRMD`. Run 41001046783's `xnu-kernel` and `xnu-buildtree` ZIPs were downloaded into the workspace and their SHA-256 values match the recorded Actions artifact digests. The `kernel.release.sweet` inside the kernel ZIP hashes to `e3e8f46de075737b6c73b3da1008423a749d5185d4d02dd397ba6ade1030c52e`, matching its included SHA256SUMS. The run log was also downloaded.
+- Patches 0099 and 0100 address battery sample validity and conservatively disable sampling while PMI8998 revision and byte order remain unverified. They are not part of the 0098 Actions artifact and have not had a full XNU build or device test. Never claim functioning battery support on this evidence. `tools/validate-repo.py` passed in WSL for all 100 patch files, 15 Python tools and 7 shell scripts; this is a format and syntax check, not a kernel build.
+- Patch 0101 corrects the PM8998 PON power/resin bits using Xiaomi's public `polaris-o-oss` driver, narrows accepted GPIO subtypes and stops the older Sweet key backend when `polariskeys=1`. The patch chain and host checks passed; actual revision, transport and HID functionality on the phone have not been tested.
+- Offline ADT analysis shows the examined `polaris.adt` lacks `/soc` and `/vendor`: 0094/0095 GPU, Wi-Fi, Bluetooth, camera, NFC and fingerprint node gates cannot pass on that serialized tree. ABL's FDT is separate from the Apple ADT passed to XNU; the selected hardware DTB and runtime IORegistry are not established. See `polaris_ios16_driver_research/reports/ADT_FDT_PROBE_ANALYSIS_CN.md` in the parent workspace.
+- An 0098 diagnostic Android boot image was assembled offline in the parent workspace under `polaris_ios16_driver_package/`; SHA-256 `47edad3f7b9436dd472e29c8cb18a6f8c69de9498b2ebbd9077fb1de131d7d04`. The package verification passes locally. It contains neither patch 0099 nor 0100 and does not establish working peripherals or a successful boot. No phone was connected.
+- The handset remains on MIUI; no phone operation was performed. Do not treat successful compilation, probes or an assembled diagnostic image as proof that the requested hardware drivers work.
+
 ## Build 4 / Polaris 0098 verification (2026-10-30)
 
 - GitHub Actions run **41001046783** for commit `f4e6f3886757a449a7d4a82b3e4c32aa4df64d76` completed with **success** on `macos-14` (workflow run number 4; `RELEASE`/`SWEET`, `keep_going=false`).
 - The build completed the XNU compile and packaged both artifacts:
   - `xnu-kernel`, artifact `12953681794`, 53,804,528 bytes, SHA-256 `10f18c9b524e54c46f8af9c057d30cc23eda4f87d8a0ea2ade21c370451aed5b`.
   - `xnu-buildtree`, artifact `12953248104`, 52,315,303 bytes, SHA-256 `4be4c28a0d1bd58bbc3a11bfe9b1022edd6349aa7cd92c0648ac40ff1583d22a` (expires 2026-11-06).
-- The artifacts are still retained by GitHub, but the public artifact-download endpoint requires an authenticated GitHub session. No kernel artifact has been flashed or used with a phone.
+- The artifacts were subsequently downloaded using the authenticated SPRMD Git credential and checked as recorded above. No kernel artifact has been flashed or used with a phone.
 - Current local branch: `codex/polaris-drivers-0096`; local and fork remotes point to `SPRMD/ios-sweet`. No upstream pull request was opened.
 
 ## Fork handoff (2026-10-30)

@@ -1,0 +1,44 @@
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+--- a/iokit/Kernel/arm/PolarisBattery.cpp
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -11,6 +11,8 @@
+  * Enable with polarisbattery=1. A failed read marks the source unavailable
+  * and the sample invalid; unknown charge and voltage are not represented
+  * as a full battery.
++ * Hardware sampling is currently gated off: the PMIC revision is unknown,
++ * and PMI8998 revisions differ in current/voltage byte order.
+  */
+ #include "PolarisDriverSupport.h"
+ 
+@@ -92,6 +94,15 @@
+ static const uint8_t kBattInfoVoltage = 0xa0;
+ static const uint8_t kBattInfoCurrent = 0xa2;
+ static const unsigned kNominalCapacityMah = 3400;
++
++/* Do not infer the PMIC revision from the fuel-gauge peripheral subtype or
++ * from plausible voltage values. This gate must be replaced by a validated
++ * PMIC revid reader and a revision-aware decoder before enabling sampling. */
++static bool
++polarisBatteryRevisionVerified(void)
++{
++	return false;
++}
+ 
+ bool
+ PolarisBattery::readPair(uint16_t peripheral, uint8_t reg, uint16_t *value)
+@@ -233,11 +244,13 @@
+ 	    "SID2/0x40 SOC +0x09; SID2/0x41 voltage +0xa0 current +0xa2 temp +0x50");
+ 	PolarisDriver::publishString(this, "ChargerStatus",
+ 	    "not claimed; SMB2 charger remains firmware-owned");
++	putBool("PolarisBatteryRevisionVerified", false);
+ 	if (!PolarisDriver::bootArgEnabled("polarisbattery") ||
+-	    !PolarisDriver::spmiInit()) {
++	    !polarisBatteryRevisionVerified() || !PolarisDriver::spmiInit()) {
+ 		fReal = false;
+ 		publish(0, 0, 0, 0, false, false);
+-		PolarisDriver::publishString(this, "PolarisDriverState", "fallback; set polarisbattery=1");
++		PolarisDriver::publishString(this, "PolarisBatteryRevisionState",
++		    "unknown; hardware sampling disabled");
+ 	} else {
+ 		fReal = true;
+ 		poll();

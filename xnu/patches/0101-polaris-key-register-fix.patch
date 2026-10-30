@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/PolarisKeys.cpp b/iokit/Kernel/arm/PolarisKeys.cpp
+--- a/iokit/Kernel/arm/PolarisKeys.cpp
++++ b/iokit/Kernel/arm/PolarisKeys.cpp
+@@ -57,8 +57,8 @@
+ static const uint16_t kPONPeripheral = 0x008; /* PM8998 SID0, PON */
+ static const uint16_t kGPIO6Peripheral = 0x0c5; /* PM8998 SID0, GPIO6 */
+ static const uint8_t kPONStatus = 0x10;
+-static const uint8_t kPONPowerMask = 0x80; /* KPDPWR_N */
+-static const uint8_t kPONResinMask = 0x40; /* RESIN_N */
++static const uint8_t kPONPowerMask = 0x01; /* KPDPWR_N */
++static const uint8_t kPONResinMask = 0x02; /* RESIN_N */
+ static const uint8_t kGPIOStatus = 0x10;
+ static const uint8_t kGPIOMode = 0x40;
+ static const uint8_t kGPIOPull = 0x42;
+@@ -70,7 +70,9 @@
+ 	uint8_t type = 0, subtype = 0;
+ 	bool ponKnown = PolarisDriver::spmiReadByte(kPONPeripheral, 0x04, &type) &&
+ 	    PolarisDriver::spmiReadByte(kPONPeripheral, 0x05, &subtype);
+-	if (!ponKnown || type != 0x01 || subtype != 0x09) {
++	/* qpnp-power-on recognizes subtypes 1 through 5; the observed type is
++	 * logged, but no unsupported type constant is assumed. */
++	if (!ponKnown || subtype < 1 || subtype > 5) {
+ 		IOLog("POLARIS KEYS: PON identity rejected type=%#x subtype=%#x\\n",
+ 		    type, subtype);
+ 	} else {
+@@ -88,7 +90,7 @@
+ 		    PolarisDriver::spmiReadByte(kGPIO6Peripheral, kGPIOStatus, &level);
+ 	}
+ 	const unsigned direction = mode & 3U;
+-	if (!gpioKnown || type != 0x10 || subtype < 0x10 || subtype > 0x13 ||
++	if (!gpioKnown || type != 0x10 || (subtype != 0x10 && subtype != 0x11) ||
+ 	    direction != 0 || (pull & 7U) >= 4 ||
+ 	    !(enable & 0x80U)) {
+ 		IOLog("POLARIS KEYS: GPIO6 identity/config rejected type=%#x subtype=%#x "
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -127,7 +127,13 @@
+ sweet_keys_init(void)
+ {
+ 	int enabled = 1;
++	int polarisKeys = 0;
+ 	thread_t thread;
++	(void)PE_parse_boot_argn("polariskeys", &polarisKeys, sizeof(polarisKeys));
++	if (polarisKeys == 1) {
++		printf("SWEET KEYS: disabled when PolarisKeys is requested\n");
++		return;
++	}
+ 	if (!sweet_touch_board()) {
+ 		printf("SWEET KEYS: SM7150 not confirmed; PMIC driver prohibited\n");
+ 		return;

@@ -1,0 +1,145 @@
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+--- a/iokit/Kernel/arm/PolarisBattery.cpp
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -8,13 +8,31 @@
+  * accesses the MEMIF SRAM window, charger votes, JEITA configuration or
+  * interrupt registers.
+  *
+- * Enable with polarisbattery=1.  A failed read publishes a conservative
+- * fallback source so powerd still has a complete battery object; the
+- * HardwareSampleValid property makes that fallback visible in diagnostics.
++ * Enable with polarisbattery=1. A failed read marks the source unavailable
++ * and the sample invalid; unknown charge and voltage are not represented
++ * as a full battery.
+  */
+ #include "PolarisDriverSupport.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
++
++#if !defined(POLARIS_DRIVER_HOST_TEST)
++/* Both SOC copies must agree. Zero is a valid measurement, not an error. */
++static bool
++polarisSocPercent(uint16_t raw, unsigned *percent)
++{
++	if (percent == NULL) {
++		return false;
++	}
++	const uint8_t primary = (uint8_t)(raw & 0xffU);
++	const uint8_t shadow = (uint8_t)(raw >> 8);
++	if (primary != shadow) {
++		return false;
++	}
++	*percent = ((unsigned)primary * 100U + 127U) / 255U;
++	return true;
++}
++#endif
+ 
+ #if !defined(POLARIS_DRIVER_HOST_TEST)
+ #include <IOKit/IOLib.h>
+@@ -48,7 +66,6 @@
+ 	void putBool(const char *key, bool value);
+ 	void putNumber(const char *key, long long value);
+ 	static bool readPair(uint16_t peripheral, uint8_t reg, uint16_t *value);
+-	static unsigned socPercent(uint16_t raw);
+ 	IOWorkLoop *fWorkLoop = NULL;
+ 	IOTimerEventSource *fTimer = NULL;
+ 	bool fTimerAdded = false;
+@@ -95,18 +112,6 @@
+ 	return false;
+ }
+ 
+-unsigned
+-PolarisBattery::socPercent(uint16_t raw)
+-{
+-	/* The Gen3 driver exposes a shadow byte and rejects mismatched copies. */
+-	uint8_t bytes[2] = {(uint8_t)(raw & 0xffU), (uint8_t)(raw >> 8)};
+-	if (bytes[0] != bytes[1]) {
+-		return 0;
+-	}
+-	unsigned value = ((unsigned)bytes[0] * 100U + 127U) / 255U;
+-	return value > 100U ? 100U : value;
+-}
+-
+ void
+ PolarisBattery::putBool(const char *key, bool value)
+ {
+@@ -133,10 +138,10 @@
+ PolarisBattery::publish(unsigned percent, unsigned mv, int ma, int temperature,
+     bool measured, bool currentValid)
+ {
+-	setBatteryInstalled(true);
+-	const unsigned capacity = (kNominalCapacityMah * percent + 50U) / 100U;
++	setBatteryInstalled(measured);
++	const unsigned capacity = measured ? (kNominalCapacityMah * percent + 50U) / 100U : 0U;
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(kNominalCapacityMah);
++	setMaxCapacity(measured ? kNominalCapacityMah : 0U);
+ 	setExternalConnected(false);
+ 	setExternalChargeCapable(false);
+ 	setIsCharging(false);
+@@ -149,7 +154,7 @@
+ 	putBool("FullyCharged", measured && percent >= 100);
+ 	putBool("AppleRawExternalConnected", false);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", kNominalCapacityMah);
++	putNumber("AppleRawMaxCapacity", measured ? kNominalCapacityMah : 0U);
+ 	putNumber("NominalChargeCapacity", kNominalCapacityMah);
+ 	putNumber("DesignCapacity", kNominalCapacityMah);
+ 	putNumber("InstantAmperage", ma);
+@@ -176,12 +181,12 @@
+ 	    readPair(kBattInfoPeripheral, kBattInfoCurrent, &rawCurrent) &&
+ 	    readPair(kBattInfoPeripheral, kBattInfoTemp, &rawTemperature);
+ 	if (!valid) {
+-		publish(100, 4200, 0, 2500, false, false);
++		publish(0, 0, 0, 0, false, false);
+ 		return;
+ 	}
+-	unsigned percent = socPercent(rawSoc);
+-	if (percent > 100U) {
+-		publish(100, 4200, 0, 2500, false, false);
++	unsigned percent = 0;
++	if (!polarisSocPercent(rawSoc, &percent)) {
++		publish(0, 0, 0, 0, false, false);
+ 		return;
+ 	}
+ 	const unsigned mv = (unsigned)(((uint64_t)rawVoltage * 122070ULL) / 1000000ULL);
+@@ -191,7 +196,7 @@
+ 	    ((((unsigned)(rawTemperature & 0x07ffU)) + 2U) / 4U);
+ 	const int temperature = ((int)kelvinQuarter - 273) * 100;
+ 	if (mv < 2800U || mv > 4600U || temperature < -4000 || temperature > 9000) {
+-		publish(100, 4200, 0, 2500, false, false);
++		publish(0, 0, 0, 0, false, false);
+ 		return;
+ 	}
+ 	publish(percent, mv, ma, temperature, true, true);
+@@ -231,7 +236,7 @@
+ 	if (!PolarisDriver::bootArgEnabled("polarisbattery") ||
+ 	    !PolarisDriver::spmiInit()) {
+ 		fReal = false;
+-		publish(100, 4200, 0, 2500, false, false);
++		publish(0, 0, 0, 0, false, false);
+ 		PolarisDriver::publishString(this, "PolarisDriverState", "fallback; set polarisbattery=1");
+ 	} else {
+ 		fReal = true;
+@@ -248,18 +253,18 @@
+ 	} else {
+ 		if (fReal) {
+ 			fReal = false;
+-			publish(100, 4200, 0, 2500, false, false);
++			publish(0, 0, 0, 0, false, false);
+ 		}
+ 		OSSafeReleaseNULL(fTimer);
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 	}
+ 	PolarisDriver::publishString(this, "PolarisDriverState",
+-	    fReal ? "read-only SPMI fuel-gauge polling" : "fallback");
++	    fReal ? "read-only SPMI fuel-gauge polling; check sample validity" : "unavailable");
+ 	PolarisDriver::publishString(this, "DeviceOperations",
+ 	    fReal ? "SPMI observer reads only" : "none");
+ 	setName("PolarisBattery");
+ 	registerService();
+-	IOLog("POLARIS BATTERY: %s\\n", fReal ? "read-only source active" : "fallback source active");
++	IOLog("POLARIS BATTERY: %s\\n", fReal ? "read-only polling enabled; check sample validity" : "source unavailable");
+ 	return true;
+ #endif
+ }
