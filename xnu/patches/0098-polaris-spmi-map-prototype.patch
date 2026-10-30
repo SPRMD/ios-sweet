@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/PolarisDriverSupport.cpp b/iokit/Kernel/arm/PolarisDriverSupport.cpp
 --- a/iokit/Kernel/arm/PolarisDriverSupport.cpp
 +++ b/iokit/Kernel/arm/PolarisDriverSupport.cpp
-@@ -12,6 +12,10 @@ extern "C" {
+@@ -13,6 +13,10 @@ extern "C" {
  #include <machine/machine_routines.h>
  #endif
  
@@ -11,3 +11,4 @@ diff --git a/iokit/Kernel/arm/PolarisDriverSupport.cpp b/iokit/Kernel/arm/Polari
 +
  #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
  namespace PolarisDriver {
+ 
