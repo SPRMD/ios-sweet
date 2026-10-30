@@ -17,7 +17,7 @@ diff --git a/iokit/Kernel/arm/PolarisWiFi.cpp b/iokit/Kernel/arm/PolarisWiFi.cpp
 +		uint8_t scratch[PolarisCE::kDescriptorBytes * 2] = {};
 +		PolarisCE::SourceRing ring = {};
 +		bool ok = ring.init(scratch, sizeof(scratch), 2, 64) &&
-+		    ring.enqueue(0x1000, 64, 1) && ring.queued() == 1 &&
++		    ring.pushDescriptor(0x1000, 64, 1) && ring.queued() == 1 &&
 +		    ring.retireTo(1) && ring.queued() == 0;
 +		PolarisDriver::publishNumber(this, "CopyEngineOfflineSelfTest", ok ? 1 : 0);
 +		IOLog("POLARIS WIFI: offline CE ring self-test %s; no hardware access\n", ok ? "passed" : "failed");
@@ -55,7 +55,7 @@ new file mode 100644
 +        return true;
 +    }
 +    uint32_t queued() const { return (write-read) & (count-1); }
-+    bool enqueue(uint64_t dmaAddress, uint16_t length, uint16_t transferId) {
++    bool pushDescriptor(uint64_t dmaAddress, uint16_t length, uint16_t transferId) {
 +        if (!descriptors || count < 2 || !length || length > maxBytes ||
 +            dmaAddress > (UINT64_C(1)<<35) - length || transferId > 0xfff ||
 +            ((write+1)&(count-1)) == read) return false;

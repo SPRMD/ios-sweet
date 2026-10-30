@@ -1,0 +1,13 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -260,8 +260,7 @@
+ bool
+ SweetBattery::start(IOService *provider)
+ {
+-	if (PolarisDriver::boardMatches() &&
+-	    PolarisDriver::bootArgEnabled("polarisbattery")) {
++	if (PolarisDriver::boardMatches()) {
+ 		IOLog("SWEET BATTERY: skipped on Polaris; PolarisBattery owns the power source\n");
+ 		return false;
+ 	}

@@ -1,0 +1,177 @@
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+--- a/iokit/Kernel/arm/PolarisBattery.cpp
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -21,24 +21,6 @@
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ 
+ #if !defined(POLARIS_DRIVER_HOST_TEST)
+-/* Both SOC copies must agree. Zero is a valid measurement, not an error. */
+-static bool
+-polarisSocPercent(uint16_t raw, unsigned *percent)
+-{
+-	if (percent == NULL) {
+-		return false;
+-	}
+-	const uint8_t primary = (uint8_t)(raw & 0xffU);
+-	const uint8_t shadow = (uint8_t)(raw >> 8);
+-	if (primary != shadow) {
+-		return false;
+-	}
+-	*percent = ((unsigned)primary * 100U + 127U) / 255U;
+-	return true;
+-}
+-#endif
+-
+-#if !defined(POLARIS_DRIVER_HOST_TEST)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -69,12 +51,12 @@
+ 	    bool measured, bool currentValid);
+ 	void putBool(const char *key, bool value);
+ 	void putNumber(const char *key, long long value);
+-	static bool readPair(uint16_t peripheral, uint8_t reg, uint16_t *value);
+ 	IOWorkLoop *fWorkLoop = NULL;
+ 	IOTimerEventSource *fTimer = NULL;
+ 	bool fTimerAdded = false;
+ 	bool fRunning = false;
+ 	bool fReal = false;
++	PolarisBatteryRevision::Kind fRevision = PolarisBatteryRevision::Unknown;
+ #endif
+ };
+ 
+@@ -87,14 +69,6 @@
+ );
+ 
+ #if !defined(POLARIS_DRIVER_HOST_TEST)
+-static const uint16_t kBattSocPeripheral = 0x240; /* SID2, reg base 0x4000 */
+-static const uint16_t kBattInfoPeripheral = 0x241; /* SID2, reg base 0x4100 */
+-static const uint8_t kBattSocSubtype = 0x10;
+-static const uint8_t kBattInfoSubtype = 0x11;
+-static const uint8_t kBattSocMonotonic = 0x09;
+-static const uint8_t kBattInfoTemp = 0x50;
+-static const uint8_t kBattInfoVoltage = 0xa0;
+-static const uint8_t kBattInfoCurrent = 0xa2;
+ static const unsigned kNominalCapacityMah = 3400;
+ 
+ static bool
+@@ -110,25 +84,6 @@
+ static bool
+ polarisBatteryRevisionVerified(void)
+ {
+-	return false;
+-}
+-
+-bool
+-PolarisBattery::readPair(uint16_t peripheral, uint8_t reg, uint16_t *value)
+-{
+-	uint8_t first[2] = {}, second[2] = {};
+-	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+-		if (!PolarisDriver::spmiRead(peripheral, reg, first, 2)) {
+-			return false;
+-		}
+-		if (!PolarisDriver::spmiRead(peripheral, reg, second, 2)) {
+-			return false;
+-		}
+-		if (first[0] == second[0] && first[1] == second[1]) {
+-			*value = (uint16_t)first[0] | ((uint16_t)first[1] << 8);
+-			return true;
+-		}
+-	}
+ 	return false;
+ }
+ 
+@@ -189,37 +144,18 @@
+ void
+ PolarisBattery::poll(void)
+ {
+-	uint8_t socSubtype = 0, infoSubtype = 0;
+-	uint16_t rawSoc = 0, rawVoltage = 0, rawCurrent = 0, rawTemperature = 0;
+-	const bool identities =
+-	    PolarisDriver::spmiReadByte(kBattSocPeripheral, 0x05, &socSubtype) &&
+-	    PolarisDriver::spmiReadByte(kBattInfoPeripheral, 0x05, &infoSubtype) &&
+-	    socSubtype == kBattSocSubtype && infoSubtype == kBattInfoSubtype;
+-	const bool valid = identities &&
+-	    readPair(kBattSocPeripheral, kBattSocMonotonic, &rawSoc) &&
+-	    readPair(kBattInfoPeripheral, kBattInfoVoltage, &rawVoltage) &&
+-	    readPair(kBattInfoPeripheral, kBattInfoCurrent, &rawCurrent) &&
+-	    readPair(kBattInfoPeripheral, kBattInfoTemp, &rawTemperature);
+-	if (!valid) {
++	PolarisFuelGauge::Sample sample = {};
++	if (!PolarisFuelGauge::readSample(polarisReadRevision, NULL, fRevision, &sample) ||
++	    sample.millivolts < 2800U || sample.millivolts > 4600U ||
++	    sample.temperatureDeciCelsius < -400 || sample.temperatureDeciCelsius > 900) {
+ 		publish(0, 0, 0, 0, false, false);
+ 		return;
+ 	}
+-	unsigned percent = 0;
+-	if (!polarisSocPercent(rawSoc, &percent)) {
+-		publish(0, 0, 0, 0, false, false);
+-		return;
+-	}
+-	const unsigned mv = (unsigned)(((uint64_t)rawVoltage * 122070ULL) / 1000000ULL);
+-	int16_t signedRaw = (int16_t)rawCurrent;
+-	const int ma = (int)(-((int64_t)signedRaw * 488281LL) / 1000000LL);
+-	const unsigned kelvinQuarter =
+-	    ((((unsigned)(rawTemperature & 0x07ffU)) + 2U) / 4U);
+-	const int temperature = ((int)kelvinQuarter - 273) * 100;
+-	if (mv < 2800U || mv > 4600U || temperature < -4000 || temperature > 9000) {
+-		publish(0, 0, 0, 0, false, false);
+-		return;
+-	}
+-	publish(percent, mv, ma, temperature, true, true);
++	/* Current polarity and centidegree units follow the existing SweetBattery
++	 * convention and must be verified against an actual iOS device. */
++	publish(sample.percent, sample.millivolts,
++	    -sample.currentMicroamps / 1000, sample.temperatureDeciCelsius * 10,
++	    true, true);
+ }
+ 
+ void
+@@ -260,6 +196,7 @@
+ 	    PolarisBatteryRevision::identify(polarisReadRevision, NULL, &revision);
+ 	PolarisDriver::publishNumber(this, "PolarisBatteryRevisionRecognized", revisionRecognized ? 1 : 0);
+ 	if (revisionRecognized) {
++		fRevision = revision.kind;
+ 		PolarisDriver::publishNumber(this, "PolarisBatteryRevisionMajor", revision.rev4);
+ 		PolarisDriver::publishString(this, "PolarisBatteryRevisionClass",
+ 		    revision.kind == PolarisBatteryRevision::Early ? "early; byte-swapped" : "v2; little-endian");
+diff --git a/iokit/Kernel/arm/PolarisFuelGauge.h b/iokit/Kernel/arm/PolarisFuelGauge.h
+--- a/iokit/Kernel/arm/PolarisFuelGauge.h
++++ b/iokit/Kernel/arm/PolarisFuelGauge.h
+@@ -31,4 +31,35 @@
+ 	*out = value;
+ 	return true;
+ }
++/* Stable paired reads prevent combining bytes sampled across updates. */
++static inline bool readPair(PolarisBatteryRevision::Read read, void *context,
++    uint16_t peripheral, uint8_t reg, uint8_t out[2])
++{
++	uint8_t first[2], second[2];
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		if (!read(context, peripheral, reg, first, 2) ||
++		    !read(context, peripheral, reg, second, 2)) return false;
++		if (first[0] == second[0] && first[1] == second[1]) {
++			out[0] = first[0]; out[1] = first[1]; return true;
++		}
++	}
++	return false;
++}
++
++static inline bool readSample(PolarisBatteryRevision::Read read, void *context,
++    PolarisBatteryRevision::Kind revision, Sample *out)
++{
++	if (!read || !out || (revision != PolarisBatteryRevision::Early &&
++	    revision != PolarisBatteryRevision::V2)) return false;
++	uint8_t socSubtype = 0, infoSubtype = 0;
++	uint8_t soc[2], voltage[2], current[2], temperature[2];
++	if (!read(context, 0x240, 0x05, &socSubtype, 1) ||
++	    !read(context, 0x241, 0x05, &infoSubtype, 1) ||
++	    socSubtype != 0x10 || infoSubtype != 0x11 ||
++	    !readPair(read, context, 0x240, 0x09, soc) ||
++	    !readPair(read, context, 0x241, 0xa0, voltage) ||
++	    !readPair(read, context, 0x241, 0xa2, current) ||
++	    !readPair(read, context, 0x241, 0x50, temperature)) return false;
++	return convert(revision, soc, voltage, current, temperature, out);
++}
+ } /* namespace PolarisFuelGauge */

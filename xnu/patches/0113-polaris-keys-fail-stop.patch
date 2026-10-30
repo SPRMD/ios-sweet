@@ -1,0 +1,101 @@
+diff --git a/iokit/Kernel/arm/PolarisKeys.cpp b/iokit/Kernel/arm/PolarisKeys.cpp
+--- a/iokit/Kernel/arm/PolarisKeys.cpp
++++ b/iokit/Kernel/arm/PolarisKeys.cpp
+@@ -34,8 +34,10 @@
+ 
+ private:
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	void poll(void);
+ 	void report(unsigned key, bool pressed);
++	void disableLane(bool pon);
+ 	bool configure(void);
+ 	IOWorkLoop *fWorkLoop = NULL;
+ 	IOTimerEventSource *fTimer = NULL;
+@@ -146,6 +148,25 @@
+ }
+ 
+ void
++PolarisKeys::disableLane(bool pon)
++{
++	bool *usable = pon ? &fPONUsable : &fGPIOUsable;
++	if (!*usable) return;
++	*usable = false;
++	/* Fail the whole lane closed on an ambiguous read. Pair any down event
++	 * once, then suppress further events on this lane until service restart. */
++	for (unsigned key = 0; key < 3; ++key) {
++		if ((key != 1) != pon) continue;
++		if (fDown[key]) {
++			fDown[key] = false;
++			sweet_hid_key((int)key, 0);
++		}
++		fLive[key] = false;
++		fCandidateValid[key] = false;
++	}
++}
++
++void
+ PolarisKeys::poll(void)
+ {
+ 	uint8_t pon = 0, gpio = 0;
+@@ -156,10 +177,17 @@
+ 	if (ponOK) {
+ 		report(0, (pon & kPONPowerMask) != 0);
+ 		report(2, (pon & kPONResinMask) != 0);
++	} else if (fPONUsable) {
++		disableLane(true);
++		IOLog("POLARIS KEYS: PON read failed; lane disabled until restart\\n");
+ 	}
+ 	if (gpioOK) {
+ 		report(1, !(gpio & 1U));
+-	}
++	} else if (fGPIOUsable) {
++		disableLane(false);
++		IOLog("POLARIS KEYS: GPIO read failed; lane disabled until restart\\n");
++	}
++	if (!fPONUsable && !fGPIOUsable) fEnabled = false;
+ }
+ 
+ void
+@@ -168,7 +196,7 @@
+ 	PolarisKeys *self = OSDynamicCast(PolarisKeys, owner);
+ 	if (self != NULL && self->fEnabled) {
+ 		self->poll();
+-		sender->setTimeoutMS(16);
++		if (self->fEnabled) sender->setTimeoutMS(16);
+ 	}
+ }
+ #endif /* !POLARIS_DRIVER_HOST_TEST */
+@@ -233,14 +261,28 @@
+ }
+ 
+ #if !defined(POLARIS_DRIVER_HOST_TEST)
++IOReturn
++PolarisKeys::stopPolling(OSObject *owner, void *, void *, void *, void *)
++{
++	PolarisKeys *self = OSDynamicCast(PolarisKeys, owner);
++	if (self == NULL) return kIOReturnBadArgument;
++	self->fEnabled = false;
++	if (self->fTimer != NULL) {
++		self->fTimer->cancelTimeout();
++		self->fTimer->disable();
++	}
++	self->disableLane(true);
++	self->disableLane(false);
++	return kIOReturnSuccess;
++}
++
+ void
+ PolarisKeys::stop(IOService *provider)
+ {
+-	fEnabled = false;
+-	if (fTimer != NULL) {
+-		fTimer->cancelTimeout();
+-	}
++	/* Wait for any active poll before removing the event source or emitting
++	 * the final releases. The workloop gate also prevents timer re-arming. */
+ 	if (fWorkLoop != NULL && fTimerAdded) {
++		(void)fWorkLoop->runAction(&PolarisKeys::stopPolling, this);
+ 		fWorkLoop->removeEventSource(fTimer);
+ 		fTimerAdded = false;
+ 	}
