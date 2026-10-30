@@ -1,0 +1,89 @@
+diff --git a/iokit/Kernel/arm/PolarisBluetooth.cpp b/iokit/Kernel/arm/PolarisBluetooth.cpp
+--- a/iokit/Kernel/arm/PolarisBluetooth.cpp
++++ b/iokit/Kernel/arm/PolarisBluetooth.cpp
+@@ -1,4 +1,5 @@
+ #include "PolarisDriverSupport.h"
++#include "PolarisQcaProtocol.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ class PolarisBluetooth : public IOService
+@@ -29,7 +30,15 @@
+ 	unsigned rangeCount = slim != NULL ? PolarisDriver::readRanges(slim, ranges, 2) : 0;
+ 	PolarisDriver::publishCommon(this, "Bluetooth", "probe-only", false);
+ 	PolarisDriver::publishString(this, "ChipFamily", "Qualcomm WCN3990");
+-	PolarisDriver::publishString(this, "Transport", "SlimBus btfmslim_slave");
++	uint8_t command[5] = {};
++	if (PolarisQca::versionRequest(command, sizeof(command)) != sizeof(command)) {
++		OSSafeReleaseNULL(slim);
++		OSSafeReleaseNULL(vendor);
++		return false;
++	}
++	PolarisDriver::publishString(this, "Transport", "WCN3990 HCI UART6 per upstream Polaris DTS; not connected");
++	PolarisDriver::publishString(this, "SlimBusRole", "BT/FM auxiliary interface; not assumed to be HCI control transport");
++	PolarisDriver::publishNumber(this, "QcaVersionRequestBytes", sizeof(command));
+ 	PolarisDriver::publishString(this, "FirmwareSet", "apbtfw10.tlv,apbtfw11.tlv,crbtfw11.tlv,crbtfw20.tlv,crbtfw21.tlv,apnv*.bin,crnv*.bin");
+ 	PolarisDriver::publishString(this, "BlueToolCompatibility", "not assumed; Apple BlueTool protocol is not a WCN3990 driver");
+ 	PolarisDriver::publishNumber(this, "SlimBusResourceCount", rangeCount);
+diff --git a/iokit/Kernel/arm/PolarisQcaProtocol.h b/iokit/Kernel/arm/PolarisQcaProtocol.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisQcaProtocol.h
+@@ -0,0 +1,58 @@
++/* WCN3990 UART protocol helpers. No transport or hardware access. */
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++
++namespace PolarisQca {
++enum { kMaxSegment = 243, kMaxEvent = 258 };
++struct Version { uint32_t product; uint16_t patch; uint16_t rom; uint32_t soc; };
++
++/* H4 command packet: type, little-endian opcode, parameter length, bytes. */
++static inline size_t versionRequest(uint8_t *out, size_t cap)
++{
++    if (!out || cap < 5) return 0;
++    out[0]=1; out[1]=0; out[2]=0xfc; out[3]=1; out[4]=0x19;
++    return 5;
++}
++static inline size_t segmentRequest(const uint8_t *data, size_t len, uint8_t *out, size_t cap)
++{
++    if (!data || !out || !len || len > kMaxSegment || cap < len + 6) return 0;
++    out[0]=1; out[1]=0; out[2]=0xfc; out[3]=(uint8_t)(len+2);
++    out[4]=0x1e; out[5]=(uint8_t)len;
++    for (size_t i=0; i<len; ++i) out[6+i]=data[i];
++    return len+6;
++}
++static inline uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
++static inline uint32_t le32(const uint8_t *p) { return (uint32_t)le16(p) | ((uint32_t)le16(p+2) << 16); }
++
++/* WCN3990 version VSE payload: response=0, subtype=2, followed by
++ * product, patch, ROM and SoC values in little-endian order. */
++static inline bool parseVersionEvent(const uint8_t *event, size_t len, Version *out)
++{
++    if (!event || !out || len != 17 || event[0] != 4 || event[1] != 0xff ||
++        event[2] != 14 || event[3] != 0 || event[4] != 2) return false;
++    Version v = {le32(event+5), le16(event+9), le16(event+11), le32(event+13)};
++    if (!v.rom || !v.soc) return false;
++    *out=v; return true;
++}
++static inline bool parseSegmentEvent(const uint8_t *event, size_t len)
++{
++    return event && len == 6 && event[0] == 4 && event[1] == 0xff &&
++        event[2] == 3 && event[3] == 0 && event[4] == 4 && event[5] == 0;
++}
++
++/* Incremental H4 event assembly. An unsupported packet type resets the
++ * parser; a completed frame remains available until reset is called. */
++struct EventReader {
++    uint8_t bytes[kMaxEvent]; size_t used; size_t expected;
++    void reset() { used=0; expected=0; }
++    int feed(uint8_t byte) {
++        if (expected && used == expected) return -1;
++        if (!used && byte != 4) return -1;
++        if (used >= kMaxEvent) { reset(); return -1; }
++        bytes[used++]=byte;
++        if (used == 3) expected=(size_t)bytes[2]+3;
++        return expected && used == expected ? 1 : 0;
++    }
++};
++}

@@ -1,0 +1,121 @@
+diff --git a/iokit/Kernel/arm/PolarisNCI.h b/iokit/Kernel/arm/PolarisNCI.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisNCI.h
+@@ -0,0 +1,96 @@
++/*
++ * Transport-independent, bounded NCI 1.x control framing for Polaris.
++ * No GPIO, I2C, interrupt, firmware, NFC daemon or hardware operations here.
++ * Caller serializes access and supplies complete packets and timeouts.
++ */
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++
++namespace PolarisNCI {
++
++static const size_t HeaderSize = 3;
++static const size_t MaxFrameSize = HeaderSize + 255;
++
++struct Packet {
++	uint8_t type, group, opcode, length;
++	const uint8_t *payload;
++};
++
++/* Complete unfragmented control packets only: fragmented packets require a
++ * reassembly layer and must never be treated as complete responses. */
++static inline bool parseControl(const uint8_t *data, size_t size, Packet *out)
++{
++	if (data == NULL || out == NULL || size < HeaderSize || size > MaxFrameSize)
++		return false;
++	const uint8_t type = (data[0] >> 5) & 7U;
++	if ((data[0] & 0x10U) != 0 || type < 1 || type > 3 ||
++	    (data[1] & 0xc0U) != 0 || size != HeaderSize + (size_t)data[2])
++		return false;
++	out->type = type;
++	out->group = data[0] & 0x0fU;
++	out->opcode = data[1] & 0x3fU;
++	out->length = data[2];
++	out->payload = data + HeaderSize;
++	return true;
++}
++
++/* Only the NCI 1.x CORE_RESET and CORE_INIT exchange is implemented.
++ * The sender must call timeout() if its own deadline expires. */
++class CoreHandshake {
++public:
++	enum State { Idle, AwaitReset, SendInit, AwaitInit, Ready, Failed };
++	CoreHandshake() : fState(Idle) {}
++	State state() const { return fState; }
++	void reset() { fState = Idle; }
++	void timeout() { if (fState != Ready) fState = Failed; }
++
++	/* reset_type 0 keeps existing configuration; no firmware mode implied. */
++	size_t nextCommand(uint8_t *out, size_t capacity) {
++		if (out == NULL) return 0;
++		if (fState == Idle && capacity >= 4) {
++			out[0] = 0x20; out[1] = 0x00; out[2] = 0x01; out[3] = 0x00;
++			fState = AwaitReset;
++			return 4;
++		}
++		if (fState == SendInit && capacity >= 3) {
++			out[0] = 0x20; out[1] = 0x01; out[2] = 0x00;
++			fState = AwaitInit;
++			return 3;
++		}
++		return 0;
++	}
++
++	/* Returns false on any malformed, mismatched, or unsuccessful response.
++	 * Notifications are not consumed here and must be dispatched separately. */
++	bool acceptResponse(const uint8_t *data, size_t size) {
++		Packet p = {};
++		if ((fState != AwaitReset && fState != AwaitInit) ||
++		    !parseControl(data, size, &p) || p.type != 2 || p.group != 0 ||
++		    p.length == 0 || p.payload[0] != 0) {
++			fState = Failed;
++			return false;
++		}
++		if (fState == AwaitReset) {
++			/* NCI 2.x has a different reset exchange: do not guess. */
++			if (p.opcode != 0 || p.length != 3 || (p.payload[1] >> 4) != 1) {
++				fState = Failed;
++				return false;
++			}
++			fState = SendInit;
++			return true;
++		}
++		/* NCI 1.x CORE_INIT has 6 fixed prefix bytes, a variable interface
++		 * list and 11 fixed suffix bytes. Check before any future decoding. */
++		if (p.opcode != 1 || p.length < 17 ||
++		    p.length != (size_t)17 + p.payload[5]) {
++			fState = Failed;
++			return false;
++		}
++		fState = Ready;
++		return true;
++	}
++private:
++	State fState;
++};
++} /* namespace PolarisNCI */
+diff --git a/iokit/Kernel/arm/PolarisNFC.cpp b/iokit/Kernel/arm/PolarisNFC.cpp
+--- a/iokit/Kernel/arm/PolarisNFC.cpp
++++ b/iokit/Kernel/arm/PolarisNFC.cpp
+@@ -8,6 +8,7 @@
+  * load firmware.
+  */
+ #include "PolarisDriverSupport.h"
++#include "PolarisNCI.h"
+ 
+ #if defined(SWEET) || defined(POLARIS_DRIVER_HOST_TEST)
+ class PolarisNFC : public IOService
+@@ -46,7 +47,7 @@
+ 	    "/firmware/libpn553_fw.so,/firmware/libpn553_rec.so");
+ 	PolarisDriver::publishString(this, "ControlResources",
+ 	    "nq-irq,nq-ven,nq-clkreq,nq-esepwr plus NFC pinctrl");
+-	PolarisDriver::publishString(this, "NCIBackend", "not implemented; no I2C/GPIO/firmware operations");
++	PolarisDriver::publishString(this, "NCIBackend", "NCI 1.x codec available; no I2C/GPIO/firmware or iOS bridge");
+ 	PolarisDriver::publishNumber(this, "I2CNQNodePresent", nq != NULL ? 1 : 0);
+ 	PolarisDriver::publishNumber(this, "NFCGPIOPinctrlPresent", pinctrl != NULL ? 1 : 0);
+ 	PolarisDriver::publishNumber(this, "PMICClockPinctrlPresent", pmicClock != NULL ? 1 : 0);

@@ -1,0 +1,18 @@
+diff --git a/bsd/dev/polaris_gpu_diag.c b/bsd/dev/polaris_gpu_diag.c
+--- a/bsd/dev/polaris_gpu_diag.c
++++ b/bsd/dev/polaris_gpu_diag.c
+@@ -96,7 +96,13 @@ polaris_gpu_diag(void)
+ 			return;
+ 		}
+ 		reserve = (size + GPU_PAGE - 1u) & ~(GPU_PAGE - 1u);
+-		if (size != gpu_blobs[i].size || !reserve ||
++		/* MIUI V12.5.1.0.QDGCNXM ships a 31980-byte SQE; the
++		 * original diagnostic also recognizes the 32136-byte build.
++		 * A size match is metadata only, never firmware authentication
++		 * or permission to execute it on a GPU. */
++		bool knownSize = size == gpu_blobs[i].size ||
++		    (i == 0 && size == 31980u);
++		if (!knownSize || !reserve ||
+ 		    (addr & (GPU_PAGE - 1u)) ||
+ 		    addr < dram || addr > dram + dram_size ||
+ 		    reserve > dram + dram_size - addr ||
