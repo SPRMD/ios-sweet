@@ -1,0 +1,85 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -43,6 +43,7 @@
+ static bool pt_started;
+ static bool pt_hid_enabled;
+ static bool pt_reset_enabled;
++static bool pt_identity_enabled;
+ static bool pt_down[MAX_FINGERS];
+ static int pt_x[MAX_FINGERS], pt_y[MAX_FINGERS];
+ static unsigned pt_fingers;
+@@ -208,6 +209,15 @@
+ static unsigned pt_read_stage;
+ static unsigned pt_read_failure;
+ 
++/* 0xff selects the page; never consume it as an ordinary data register. */
++static bool
++pt_range_valid(uint16_t reg, unsigned len)
++{
++	unsigned low = reg & 0xffu;
++	return len > 0 && len <= MAX_READ && low < 0xffu &&
++	    len <= 0xffu - low;
++}
++
+ /* Shim-proven RMI4 protocol: write 0xff,page then STOP; address the
+  * one-byte register and repeat-start for reading. Each transfer is capped.
+  * STOP and released lines on every exit, including a failed ACK/clock. */
+@@ -217,7 +227,9 @@
+ 	bool ok = false;
+ 	pt_read_failure = 0;
+ 	pt_read_stage = 1;
+-	if (!len || len > MAX_READ || !pt_start(false)) goto out;
++	/* Invalid requests must not drive or reconfigure bus lines at all. */
++	if (!buf || !pt_range_valid(reg, len)) return false;
++	if (!pt_start(false)) goto out;
+ 	pt_read_stage = 2;
+ 	if (!pt_write(I2C_ADDR << 1)) goto out;
+ 	pt_read_stage = 3;
+@@ -416,6 +428,22 @@
+ 	    f12[3] != 0x08 || f12[5] != 0x12) {
+ 		printf("POLARIS I2C: F12 PDT identity mismatch; HID withheld\n");
+ 		goto restore;
++	}
++	if (pt_identity_enabled) {
++		/* RMI F01 basic query bytes 0..20: manufacturer is byte 0;
++		 * product ID is bytes 11..20. Diagnostic only; do not infer chip
++		 * identity from the PDT or assume an undocumented product ID. */
++		uint8_t identity[21] = {0};
++		if (pt_read(f01[0], identity, sizeof(identity))) {
++			printf("POLARIS I2C: F01 manufacturer=%02x product-id-hex=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
++			    identity[0], identity[11], identity[12], identity[13],
++			    identity[14], identity[15], identity[16], identity[17],
++			    identity[18], identity[19], identity[20]);
++		} else {
++			printf("POLARIS I2C: F01 identity read failed stage=%u reason=%u; stopping\n",
++			    pt_read_stage, pt_read_failure);
++			goto restore;
++		}
+ 	}
+ 	printf("POLARIS I2C: PDT F01 %02x %02x %02x %02x %02x %02x F12 %02x %02x %02x %02x %02x %02x\n",
+ 	    f01[0], f01[1], f01[2], f01[3], f01[4], f01[5],
+@@ -556,7 +584,7 @@
+ void
+ polaris_touch_i2c_init(void)
+ {
+-	int enabled = 0, hid_enabled = 0, reset_enabled = 0;
++	int enabled = 0, hid_enabled = 0, reset_enabled = 0, identity_enabled = 0;
+ 	thread_t thread;
+ 	if (!polaris_touch_i2c_board()) {
+ 		return;
+@@ -564,12 +592,14 @@
+ 	(void)PE_parse_boot_argn("polaristouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("polaristouchhid", &hid_enabled, sizeof(hid_enabled));
+ 	(void)PE_parse_boot_argn("polaristouchreset", &reset_enabled, sizeof(reset_enabled));
++	(void)PE_parse_boot_argn("polaristouchid", &identity_enabled, sizeof(identity_enabled));
+ 	if ((enabled != 1 && hid_enabled != 1) || pt_started) {
+ 		return;
+ 	}
+ 	pt_started = true;
+ 	pt_hid_enabled = hid_enabled == 1;
+ 	pt_reset_enabled = reset_enabled == 1;
++	pt_identity_enabled = identity_enabled == 1;
+ 	printf("POLARIS I2C: opted in; GPIO33/34 raw/PDT prototype; HID %s reset99 %s\n",
+ 	    pt_hid_enabled ? "EXPERIMENTAL" : "off", pt_reset_enabled ? "release" : "unchanged");
+ 	kern_return_t kr = kernel_thread_start(pt_thread, NULL, &thread);

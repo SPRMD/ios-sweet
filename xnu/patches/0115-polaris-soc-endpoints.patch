@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/arm/PolarisFuelGauge.h b/iokit/Kernel/arm/PolarisFuelGauge.h
+--- a/iokit/Kernel/arm/PolarisFuelGauge.h
++++ b/iokit/Kernel/arm/PolarisFuelGauge.h
+@@ -10,6 +10,16 @@
+ 	int currentMicroamps; /* Qualcomm driver convention, not iOS polarity. */
+ 	int temperatureDeciCelsius;
+ };
++
++/* MiCode's fg_get_msoc mapping with report_full=false: reserve the two
++ * endpoints for raw 0 and 255. report_full needs charger state and is not
++ * inferred here. */
++static inline unsigned conservativeSocPercent(uint8_t raw)
++{
++	if (raw == 0) return 0;
++	if (raw == 255) return 100;
++	return (((unsigned)raw - 1U) * 98U + 126U) / 253U + 1U;
++}
+ 
+ static inline bool convert(PolarisBatteryRevision::Kind revision,
+     const uint8_t soc[2], const uint8_t voltage[2], const uint8_t current[2],
+@@ -24,7 +34,7 @@
+ 	const int signedCurrent = i & 0x8000U ? (int)i - 65536 : (int)i;
+ 	const unsigned tempRaw = ((unsigned)(temperature[1] & 7U) << 8) | temperature[0];
+ 	Sample value = {};
+-	value.percent = ((unsigned)soc[0] * 100U + 127U) / 255U;
++	value.percent = conservativeSocPercent(soc[0]);
+ 	value.millivolts = (unsigned)(((uint64_t)v * 122070ULL) / 1000000ULL);
+ 	value.currentMicroamps = (int)(((int64_t)signedCurrent * 488281LL) / 1000LL);
+ 	value.temperatureDeciCelsius = ((int)((tempRaw + 2U) / 4U) - 273) * 10;
