@@ -475,3 +475,12 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+## Local touch latency candidate (2026-10-31)
+
+- Added uncommitted patch `xnu/patches/0118-polaris-touch-latency.patch` after the 0117 compatibility fallback. It targets the user's report that touch works but feels insensitive: polling changes from 20 ms to 8 ms, valid contacts start on the first frame, large coordinate jumps stay continuous instead of synthesizing an up, and up to two consecutive invalid/I2C frames are tolerated before releasing contacts.
+- `git apply --check` passes against `.local/verify-0117/xnu`; the applied scratch tree also passes `git diff --check` and the patch sequence remains contiguous through 0118. Repository validation passes with 118 patches, 15 Python tools and 7 shell scripts (using Git Bash for `bash -n`). Details are in `docs/POLARIS_TOUCH_0118.md` and `docs/POLARIS_FULL_DRIVER_PACKAGE_STATUS_0118.md`. No Apple-Clang build, CI run, fastboot boot/flash, or phone operation was performed. The patch remains a candidate until compiled and temporarily boot-tested.
+- Full-peripheral audit is recorded in `docs/POLARIS_FULL_DRIVER_PACKAGE_STATUS_0118.md`: GPU, Wi-Fi, Bluetooth, camera and NFC remain probe/protocol-only; USB is a debug CDC-ECM path; 0118 has no compiled kernel artifact. Do not label any current package as a complete-function flashable release.
+
+## Full-driver package audit (2026-10-31)
+
+- `docs/POLARIS_FULL_DRIVER_PACKAGE_STATUS_0118.md` records the current gate: GPU, Wi-Fi, Bluetooth, camera and NFC are still probe/protocol layers, USB is a debug CDC-ECM path, and 0118 has no compiled kernel artifact. Do not generate or label a package as fully functional until each backend has a real-device boot log and a distinct 0118+ kernel hash.

@@ -1,0 +1,93 @@
+diff --git a/bsd/dev/polaris_touch_i2c.c b/bsd/dev/polaris_touch_i2c.c
+--- a/bsd/dev/polaris_touch_i2c.c
++++ b/bsd/dev/polaris_touch_i2c.c
+@@ -35,6 +35,8 @@
+ #define MAX_READ      96u
+ #define MAX_FINGERS   10u
+ #define FINGER_BYTES  8u
++#define PT_POLL_MS     8u
++#define PT_BAD_FRAME_LIMIT 3u
+ 
+ static vm_offset_t pt_gpio;
+ static vm_offset_t pt_reset_gpio;
+@@ -501,11 +503,10 @@
+ 	}
+ 	if (pt_hid_enabled) {
+ 		unsigned failures = 0;
++		unsigned bad_frames = 0;
+ 		bool logged_bad_frame = false;
+-		unsigned candidates[MAX_FINGERS] = {0};
+-		int prior_x[MAX_FINGERS] = {0}, prior_y[MAX_FINGERS] = {0};
+-		printf("POLARIS HID: experimental F12 base 0x%02x, %u slots, 8 bytes each\n",
+-		    f12[3], pt_fingers);
++		printf("POLARIS HID: experimental F12 base 0x%02x, %u slots, 8 bytes each, poll=%ums immediate-down\n",
++		    f12[3], pt_fingers, PT_POLL_MS);
+ 		for (;;) {
+ 			bool valid = true, present[MAX_FINGERS] = {0};
+ 			int x[MAX_FINGERS] = {0}, y[MAX_FINGERS] = {0};
+@@ -530,15 +531,19 @@
+ 				logged_bad_frame = true;
+ 			}
+ 			if (!valid) {
+-				pt_release();
+-				for (unsigned slot = 0; slot < pt_fingers; ++slot) candidates[slot] = 0;
+-				if (++failures >= 8) {
++				/* A single bit-banged I2C miss must not make a finger disappear.
++				 * Hold the last contact for a few polls, then release it. */
++				if (++bad_frames >= PT_BAD_FRAME_LIMIT) {
++					pt_release();
++				}
++				if (++failures >= 32) {
+ 					printf("POLARIS HID: repeated read/invalid frames, stopping\n");
+ 					break;
+ 				}
+-				pt_wait(20);
++				pt_wait(PT_POLL_MS);
+ 				continue;
+ 			}
++			bad_frames = 0;
+ 			failures = 0;
+ 			for (unsigned slot = 0; slot < pt_fingers; ++slot) {
+ 				if (!present[slot]) {
+@@ -546,32 +551,23 @@
+ 						sweet_hid_touch((int)slot, 0, pt_x[slot], pt_y[slot]);
+ 						pt_down[slot] = false;
+ 					}
+-					candidates[slot] = 0;
+ 					continue;
+ 				}
+ 				if (!pt_down[slot]) {
+-					if (candidates[slot] && x[slot] - prior_x[slot] < 80 &&
+-					    prior_x[slot] - x[slot] < 80 && y[slot] - prior_y[slot] < 80 &&
+-					    prior_y[slot] - y[slot] < 80) {
+-						sweet_hid_touch((int)slot, 1, x[slot], y[slot]);
+-						pt_down[slot] = true;
+-						pt_x[slot] = x[slot]; pt_y[slot] = y[slot];
+-						candidates[slot] = 0;
+-					} else {
+-						candidates[slot] = 1;
+-					}
+-					prior_x[slot] = x[slot]; prior_y[slot] = y[slot];
+-				} else if (x[slot] - pt_x[slot] >= 200 || pt_x[slot] - x[slot] >= 200 ||
+-				    y[slot] - pt_y[slot] >= 200 || pt_y[slot] - y[slot] >= 200) {
+-					sweet_hid_touch((int)slot, 0, pt_x[slot], pt_y[slot]);
+-					pt_down[slot] = false;
+-					candidates[slot] = 0;
++					/* A valid RMI4 object is already debounced by the controller.
++					 * Start on the first frame so short taps and fast swipes are not
++					 * discarded by the old two-frame/80-pixel gate. */
++					sweet_hid_touch((int)slot, 1, x[slot], y[slot]);
++					pt_down[slot] = true;
++					pt_x[slot] = x[slot]; pt_y[slot] = y[slot];
+ 				} else if (x[slot] != pt_x[slot] || y[slot] != pt_y[slot]) {
++					/* Never synthesize an up on a large move; report the new position
++					 * directly so swipes remain continuous. */
+ 					sweet_hid_touch((int)slot, 1, x[slot], y[slot]);
+ 					pt_x[slot] = x[slot]; pt_y[slot] = y[slot];
+ 				}
+ 			}
+-			pt_wait(20);
++			pt_wait(PT_POLL_MS);
+ 		}
+ 	} else {
+ 		for (unsigned i = 0; i < 4; ++i) {
